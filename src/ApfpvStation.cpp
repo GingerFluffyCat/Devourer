@@ -401,6 +401,7 @@ static std::vector<uint8_t> buildTcp(uint32_t srcIp, uint32_t dstIp, uint16_t sp
 // AND each supervisor reconnect attempt.
 bool ApfpvStation::runConnectChain() {
     _pendingAddbaTids = 0;  // fresh ADDBA debounce per connection
+    _raCfgSent.store(false); // re-send MACID_CFG once on this (re)connection
     auto& dev = *reinterpret_cast<RtlUsbAdapter*>(_dev);
     auto& rm  = *reinterpret_cast<RadioManagementModule*>(_rm);
     auto sendFrame = [&dev](const std::vector<uint8_t>& f) {
@@ -1252,9 +1253,22 @@ void ApfpvStation::supervisorLoop() {
                     uint8_t rssi[4] = { 0x00, 0x00, 0x39, 0x06 };
                     try { d.fillH2CCmd(0x40, 7, ra); d.fillH2CCmd(0x42, 4, rssi); } catch (...) {}
                 } else {
+                    // ⭐ C2H feedback loop / kernel-cadence H2C for the firmware-RA uplink.
+                    // MACID_CFG (0x40) sets up the RA — send ONCE per connection like the kernel.
+                    // Re-sending it every tick re-inits the RA so it never converges → the uplink
+                    // rate oscillates (the user-observed 0%↔100%). RSSI (0x42) is the real per-tick
+                    // feedback the firmware RA uses for its rate ceiling — send the ACTUAL tracked
+                    // RSSI (byte2 = rssi_dBm+100, clamped 1..100), not the old hardcoded 0x2e.
                     uint8_t ra[7] = { 0x00, 0x89, 0x1a, 0x00, 0x80, 0xff, 0xff };   // kernel-verbatim
-                    uint8_t rssi[3] = { 0x00, 0x00, 0x2e };                          // kernel-verbatim
-                    try { d.fillH2CCmd(0x40, 7, ra); d.fillH2CCmd(0x42, 3, rssi); } catch (...) {}
+                    if (!_raCfgSent.exchange(true)) { try { d.fillH2CCmd(0x40, 7, ra); } catch (...) {} }
+                    int rdbm = PhydmWatchdog::RssiDbm();
+                    int rpct = rdbm + 100; if (rpct < 1) rpct = 1; if (rpct > 100) rpct = 100;
+                    uint8_t rssi[3] = { 0x00, 0x00, (uint8_t)rpct };
+                    try { d.fillH2CCmd(0x42, 3, rssi); } catch (...) {}
+                    static uint32_t raLogN = 0;
+                    if ((++raLogN % 4) == 1)
+                        SCANLOG("RA-loop: rssi=%ddBm(pct=%d) uplink_rate_idx=0x%02x",
+                                rdbm, rpct, (unsigned)PhydmWatchdog::UplinkRate());
                 }
             }
             bool lost = _deauth.load();

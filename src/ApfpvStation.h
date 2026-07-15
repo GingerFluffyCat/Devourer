@@ -147,6 +147,7 @@ private:
     std::atomic<int64_t> _lastRxMs{0};
     uint8_t _pendingAddbaTids = 0;          // TIDs queued by dispatch, sent from connect thread
     std::atomic<bool> _deauth{false};
+    std::atomic<bool> _raCfgSent{false};   // H2C MACID_CFG(0x40) sent this connection (once, like the kernel)
     std::atomic<bool> _run{false};   // supervisor running
     std::thread _supervisor;
     // RX runs on its OWN thread (RtlJaguarDevice::Init is a blocking read loop).
