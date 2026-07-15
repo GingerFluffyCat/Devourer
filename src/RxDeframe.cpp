@@ -133,6 +133,16 @@ void RxDeframe::onPacket(const Packet& pkt) {
         // [CCMP hdr 8][plaintext LLC+payload][MIC 8]. This is the lean kernel-style path.
         // GATED: env cached once; default OFF so the proven SW path stays active.
         static const bool kHwDecrypt = std::getenv("DEVOURER_HW_DECRYPT") != nullptr;  // OFF by default (no tput gain)
+        // DIAG: count HW-decrypted vs SW-fallback frames so we can SEE whether the chip is
+        // actually HW-decrypting (bdecrypted=1) after the SECCFG=0x010c fix. Logged every 4000.
+        static thread_local uint32_t hwDec = 0, swDec = 0, diagN = 0, grp = 0, uni = 0;
+        if (kHwDecrypt) {
+            if (pkt.RxAtrib.bdecrypted) hwDec++; else swDec++;
+            if (f[4] & 0x01) grp++; else uni++;   // A1 group-addressed vs unicast-to-us
+            if ((++diagN % 4000) == 0)
+                fprintf(stderr, "[rxd-hwdec] bdecrypted(HW)=%u SW-fallback=%u | group=%u unicast=%u (last4000)\n",
+                        hwDec, swDec, grp, uni), hwDec = swDec = grp = uni = 0;
+        }
         if (kHwDecrypt && pkt.RxAtrib.bdecrypted) {
             if (bodyLen <= 16) return;             // need CCMP hdr(8) + MIC(8)
             llc = body + 8; llcLen = bodyLen - 16; // strip CCMP header + trailing MIC

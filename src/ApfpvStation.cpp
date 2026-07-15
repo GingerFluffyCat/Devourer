@@ -598,6 +598,13 @@ bool ApfpvStation::runConnectChain() {
         SCANLOG("scan: \"%s\" found=%d ch=%d", _params.ssid.c_str(), ap.found?1:0, ap.channel);
         if (!ap.found) { set(State::FailNoAp); return false; }
         bssid.b = ap.bssid;
+        // Persist the discovered BSSID into _params so downstream users get the REAL AP
+        // MAC — notably setSecCamKey (HW-decrypt CAM entries) and the ADDBA frames, which
+        // read _params.bssid. Before this it stayed zero-initialized on the scan path, so
+        // the HW-decrypt CAM entry was written with MAC 00:00:.. → the security engine
+        // found no key for A2=<AP> → SWDEC=1 → HW decrypt silently never engaged. (This does
+        // NOT set _params.haveBssid, so the supervisor still re-scans on reconnect.)
+        _params.bssid = ap.bssid;
         _params.channel = ap.channel ? ap.channel : _params.channel;
         // NOTE: do NOT set _params.haveBssid here. Persisting it made every
         // supervisor RECONNECT skip the scan and jump straight to auth — and the
