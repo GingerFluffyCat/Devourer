@@ -501,14 +501,17 @@ bool ApfpvStation::runConnectChain() {
                         pos += 2 + len;
                     }
                     if (assocBw > 0) {
-                        // AP supports this bandwidth. Use MIN(AP_cap, user_selected).
-                        // User pref is already in _params.bandwidth; cap it to AP max.
-                        int userBw = _params.bandwidth;
-                        if (userBw > 40 && assocBw < 2) _params.bandwidth = 40;
-                        if (userBw > 20 && assocBw < 1) _params.bandwidth = 20;
-                        SCANLOG("assoc-response: AP bw=%dMHz, using %dMHz (user=%d)",
-                            assocBw==2?80:assocBw==1?40:20,
-                            (int)_params.bandwidth, userBw);
+                        // ADOPT the AP's advertised bandwidth automatically — the band + channel
+                        // already come from the scan, and the operating width should match what the
+                        // AP actually provides (a fixed user pref of 20 would waste an 80MHz AP). The
+                        // firmware RA adapts the MCS within the width, so wider is strictly better when
+                        // the AP offers it. DEVOURER_MAX_BW=20|40|80 caps it only if you deliberately
+                        // want to limit the width; otherwise it follows the AP.
+                        int apBw = assocBw==2?80 : assocBw==1?40 : 20;
+                        int cap = 160; if (const char* m = std::getenv("DEVOURER_MAX_BW")) cap = atoi(m);
+                        _params.bandwidth = apBw < cap ? apBw : cap;
+                        SCANLOG("assoc-response: AP bw=%dMHz -> using %dMHz (auto; off=%d cap=%d)",
+                            apBw, (int)_params.bandwidth, (int)assocOff, cap);
                     }
                 }
             }
