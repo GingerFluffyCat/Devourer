@@ -132,7 +132,7 @@ void RxDeframe::onPacket(const Packet& pkt) {
         // (descriptor SWDEC=0 -> bdecrypted), skip the SW AES entirely — the body is
         // [CCMP hdr 8][plaintext LLC+payload][MIC 8]. This is the lean kernel-style path.
         // GATED: env cached once; default OFF so the proven SW path stays active.
-        static const bool kHwDecrypt = std::getenv("DEVOURER_HW_DECRYPT") != nullptr;  // OFF by default (no tput gain)
+        static const bool kHwDecrypt = std::getenv("DEVOURER_NO_HW_DECRYPT") == nullptr;  // DEFAULT ON (matches ApfpvStation)
         // DIAG: count HW-decrypted vs SW-fallback frames so we can SEE whether the chip is
         // actually HW-decrypting (bdecrypted=1) after the SECCFG=0x010c fix. Logged every 4000.
         static thread_local uint32_t hwDec = 0, swDec = 0, diagN = 0, grp = 0, uni = 0;

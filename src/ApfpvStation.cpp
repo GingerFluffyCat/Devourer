@@ -731,14 +731,15 @@ bool ApfpvStation::runConnectChain() {
         }
     }
 
-    // ⭐ Lever C.2 (kernel-parity HW CCMP decrypt) — GATED OFF by default. When enabled, the chip
-    // decrypts RX in hardware so the single RX worker just de-aggregates + forwards plaintext
-    // (the kernel's lean tasklet), removing the per-packet SW AES-CCM from the hot path. The PTK
-    // (unicast video) goes in CAM entry 4 keyed to the AP BSSID/keyid0; the GTK (bcast) in entry 5.
-    // RxDeframe must then SKIP SW decrypt for HW-decrypted frames (pkt.bdecrypted) — that side is
-    // gated by the same env. UNTESTED end-to-end (frame layout post-HW-decrypt needs validation);
-    // ship A+B first, enable this only if the worker proves to be the throughput cap.
-    if (std::getenv("DEVOURER_HW_DECRYPT")) {   // OFF by default: HW decrypt works but didn't lift the 30Mbps cap
+    // ⭐ Lever C.2 (kernel-parity HW CCMP decrypt) — DEFAULT ON (2026-07-14). The chip decrypts RX
+    // in hardware so the single RX worker just de-aggregates + forwards plaintext (the kernel's
+    // lean tasklet), removing per-packet SW AES-CCM from the hot path. At VHT-2SS/80MHz (~50Mbps+,
+    // 5000+ frames/s) SW-CCMP on one worker falls behind and the link oscillates; HW decrypt keeps
+    // it clean and is what the firmware's full-station RA path expects. PTK (unicast video) → CAM
+    // entry 4 keyed to the AP BSSID/keyid0; GTK (bcast) → entry 5. RxDeframe skips SW decrypt for
+    // bdecrypted frames (same default). Fixed 2026-07-14: SECCFG 0x010c + _params.bssid populated
+    // → bdecrypted=4000/4000 verified. DEVOURER_NO_HW_DECRYPT reverts to the SW path.
+    if (std::getenv("DEVOURER_NO_HW_DECRYPT") == nullptr) {
         const auto& tk = _wpa->tk();
         dev.setSecCamKey(4, _params.bssid.data(), 0, tk.data());          // PTK pairwise, keyid 0
         if (_wpa->gtkKeyId() != 0xff) {
@@ -1190,6 +1191,23 @@ void ApfpvStation::supervisorLoop() {
                             uint32_t v0 = dd.rtw_read32(a), v1 = dd.rtw_read32(a+4);
                             uint32_t v2 = dd.rtw_read32(a+8), v3 = dd.rtw_read32(a+0xc);
                             SCANLOG("BBDUMP 0x%04x 0x%08x 0x%08x 0x%08x 0x%08x", a, v0, v1, v2, v3);
+                        }
+                    } catch (...) {}
+                }
+                // RF-path register dump (0x00-0x7f, path A+B) to diff vs the kernel's rf_reg_dump.
+                // Same dongle → the kernel reaches VHT-2SS, so any RX-quality gap is SOFTWARE: the
+                // RF-path calibration (LNA/gain/channel/IQK-LO) lives here, NOT in the BB page.
+                static bool rfDumped = false;
+                if (!rfDumped && std::getenv("DEVOURER_RF_DUMP")) {
+                    rfDumped = true;
+                    try {
+                        auto& rm = *reinterpret_cast<RadioManagementModule*>(_rm);
+                        for (int p = 0; p < 2; ++p) {
+                            RfPath pth = p == 0 ? RfPath::RF_PATH_A : RfPath::RF_PATH_B;
+                            for (uint32_t a = 0x00; a <= 0x7f; ++a) {
+                                uint32_t v = rm.phy_query_rf_reg(pth, a, 0xfffff);
+                                SCANLOG("RFDUMP P%d 0x%02x 0x%05x", p, a, v);
+                            }
                         }
                     } catch (...) {}
                 }
