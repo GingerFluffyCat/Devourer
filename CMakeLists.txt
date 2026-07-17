@@ -36,3 +36,6 @@ target_link_libraries(ApfpvCompliance PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,devo
 
 add_executable(ApfpvProbe demo/apfpv_probe.cpp)
 target_link_libraries(ApfpvProbe PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,devourer>" PkgConfig::libusb)
+if(WIN32)
+    target_link_libraries(ApfpvProbe PRIVATE ws2_32)
+endif()

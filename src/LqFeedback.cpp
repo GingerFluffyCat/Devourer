@@ -5,6 +5,9 @@
 // ============================================================================
 #include "LqFeedback.h"
 #include <cstdio>
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
 #include <cstring>
 #include <atomic>
 #include <thread>
@@ -20,6 +23,9 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#endif
+#if defined(__ANDROID__)
+#include <android/log.h>
 #endif
 
 namespace apfpv {
@@ -68,14 +74,26 @@ static void emit(double& sA, double& sB, bool& init) {
     // skips a leading "token=word " prefix, THEN reads the rssi fields. Without
     // the prefix the sscanf fails and the ground RSSI is ignored. Match the
     // firmware exactly (confirmed against the greg10.2 aalink binary).
+    int pctA = LqFeedback::rssiPct((int)sA), pctB = LqFeedback::rssiPct((int)sB);
     if (g.haveB)
-        n = std::snprintf(buf, sizeof(buf), "gs_string=gs rssi_a = %d(%%), rssi_b = %d(%%)\n",
-                          LqFeedback::rssiPct((int)sA), LqFeedback::rssiPct((int)sB));
+        n = std::snprintf(buf, sizeof(buf), "gs_string=gs rssi_a = %d(%%), rssi_b = %d(%%)\n", pctA, pctB);
     else
-        n = std::snprintf(buf, sizeof(buf), "gs_string=gs rssi_a = %d(%%)\n",
-                          LqFeedback::rssiPct((int)sA));
+        n = std::snprintf(buf, sizeof(buf), "gs_string=gs rssi_a = %d(%%)\n", pctA);
     if (n > 0 && g.sock >= 0)
         ::sendto(g.sock, buf, (size_t)n, 0, (sockaddr*)&g.dst, sizeof(g.dst));
+    // Also send the BARE percentage that the phone-Wi-Fi path uses (ApfpvWifiManager sends
+    // Integer.toString(pct)) — that variant is confirmed to move the VTX downlink %, whereas the
+    // verbose "gs_string=" form above may not parse on the current aalink. Belt-and-suspenders.
+    char bare[16]; int bn = std::snprintf(bare, sizeof(bare), "%d", pctA);
+    if (bn > 0 && g.sock >= 0)
+        ::sendto(g.sock, bare, (size_t)bn, 0, (sockaddr*)&g.dst, sizeof(g.dst));
+#if defined(__ANDROID__)
+    // DIAGNOSTIC: surface the RSSI→pct we are actually sending (rules out a 0-value RSSI conversion).
+    static int dbgN = 0;
+    if ((dbgN++ % 30) == 0)
+        __android_log_print(4, "apfpv-lq", "LQ send rssiA=%.0f pctA=%d (haveB=%d pctB=%d)",
+                            sA, pctA, (int)g.haveB, pctB);
+#endif
 }
 
 static void loopFixed() {

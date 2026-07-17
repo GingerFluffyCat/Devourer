@@ -108,7 +108,13 @@ public class ApfpvStaLink {
     }
     /** Instance wrapper: tear down the station link. */
     public void disconnect() {
-        if (currentFd >= 0) nativeStaDisconnect(nativeStaLink, currentFd);
+        // Call UNCONDITIONALLY: the fd arg is ignored natively (teardown uses the ctx
+        // station), and ApfpvLinkManager connects via the STATIC nativeStaConnect (not
+        // this.connect), so currentFd was never set. The old `if (currentFd >= 0)` guard
+        // therefore skipped teardown entirely -> on app pause the stale station kept the
+        // dongle fd + supervisor alive -> on resume the reconnect couldn't re-open the
+        // device. Always tear down so resume gets a clean dongle.
+        nativeStaDisconnect(nativeStaLink, currentFd);
         currentFd = -1;
     }
     public int getState() { return nativeStaGetState(nativeStaLink); }

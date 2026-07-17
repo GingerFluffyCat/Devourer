@@ -47,6 +47,12 @@ struct StaCtx {
     int                           rtpSock = -1;     // AF_UNIX DGRAM → "\0my_socket" (UDSReceiver)
     sockaddr_un                   rtpDst{};
     socklen_t                     rtpDstLen = 0;
+    // General-IP bridge for the ApfpvVpnService TUN (SSH/any TCP+UDP to the VTX over the
+    // dongle). ADDITIVE + off by default — only armed when the VpnService calls
+    // nativeStaSetIpBridge(true), so the RTP video path is untouched. Downlink: the RxDeframe
+    // IP sink sends each decrypted IPv4 packet to UDP 127.0.0.1:5601 (the VpnService reads +
+    // writes the TUN). Uplink: nativeStaSendIp() feeds TUN packets to station->sendIpPacket().
+    int                           ipDownSock = -1;  // UDP → 127.0.0.1:5601 (downlink to VpnService)
     // libusb event loop: drives the async RX URB pool + async TX (send_packet)
     // for the kernel-style station I/O. Without it the async transfers never
     // complete -> the auth never radiates.
@@ -319,7 +325,14 @@ Java_com_openipc_wfbngrtl8812_ApfpvStaLink_nativeStaConnect(
 JNIEXPORT void JNICALL
 Java_com_openipc_wfbngrtl8812_ApfpvStaLink_nativeStaDisconnect(JNIEnv*, jclass, jlong inst, jint /*fd*/) {
     auto* ctx = reinterpret_cast<StaCtx*>(inst);
-    if (ctx && ctx->station) ctx->station->disconnect();
+    if (!ctx) return;
+    if (ctx->station) ctx->station->disconnect();   // stops supervisor + RX + connect chain
+    // App-resume reconnect: the Java side closes the UsbDeviceConnection right after this,
+    // so the adopted fd is about to become invalid. Invalidate wrappedFd so the NEXT
+    // nativeStaConnect ALWAYS takes the replug teardown+rebuild path (fresh libusb ctx +
+    // re-wrap) — even if Android hands back the SAME fd number, we must not reuse the stale
+    // handle that wraps the now-closed fd.
+    ctx->wrappedFd = -1;
 }
 
 // All-SSID scan for the picker UI. Adopts the fd + builds the device/station if
@@ -391,6 +404,36 @@ Java_com_openipc_wfbngrtl8812_ApfpvStaLink_nativeStaStopBeaconCal(JNIEnv*, jclas
     if (ctx && ctx->station) ctx->station->stopBeaconCal();
 }
 
+// Dongle-as-AP (SoftAP) — WIP test path. Brings the dongle up as an 802.11 AP: beacons the SSID,
+// answers probe/auth/assoc, runs the WPA2 authenticator, and (with DEVOURER_AP_HWACK) the Jaguar1
+// HW software-beacon + per-STA ACK. Mirrors nativeStaStartBeaconCal's fd-wrap + ensureStation.
+JNIEXPORT void JNICALL
+Java_com_openipc_wfbngrtl8812_ApfpvStaLink_nativeStaStartAp(
+        JNIEnv* env, jclass, jlong inst, jint fd, jstring jssid, jint channel, jstring jpass) {
+    auto* ctx = reinterpret_cast<StaCtx*>(inst);
+    if (!ctx || !ctx->usb) return;
+    if (!ctx->handle) {
+        if (libusb_wrap_sys_device(ctx->usb, (intptr_t)fd, &ctx->handle) < 0 || !ctx->handle) {
+            LOGE("ap: libusb_wrap_sys_device failed (fd=%d)", fd); return;
+        }
+    }
+    if (!ensureStation(ctx)) { LOGE("ap: ensureStation failed"); return; }
+    const char* ssid = env->GetStringUTFChars(jssid, nullptr);
+    const char* pass = jpass ? env->GetStringUTFChars(jpass, nullptr) : nullptr;
+    // forceHwBeacon=true: Android can't set DEVOURER_AP_HWACK, and the whole point of the app
+    // button is to exercise the Jaguar1 HW software-beacon path, so enable it explicitly.
+    try { ctx->station->startAp(ssid ? ssid : "APFPV-AP", channel, pass ? pass : "", /*forceHwBeacon=*/true); }
+    catch (...) { LOGE("startAp threw"); }
+    if (ssid) env->ReleaseStringUTFChars(jssid, ssid);
+    if (pass) env->ReleaseStringUTFChars(jpass, pass);
+}
+
+JNIEXPORT void JNICALL
+Java_com_openipc_wfbngrtl8812_ApfpvStaLink_nativeStaStopAp(JNIEnv*, jclass, jlong inst) {
+    auto* ctx = reinterpret_cast<StaCtx*>(inst);
+    if (ctx && ctx->station) ctx->station->stopAp();
+}
+
 JNIEXPORT jint JNICALL
 Java_com_openipc_wfbngrtl8812_ApfpvStaLink_nativeStaGetState(JNIEnv*, jclass, jlong inst) {
     auto* ctx = reinterpret_cast<StaCtx*>(inst);
@@ -407,6 +450,16 @@ JNIEXPORT jint JNICALL
 Java_com_openipc_wfbngrtl8812_ApfpvStaLink_nativeStaGetRssi(JNIEnv*, jclass, jlong inst) {
     auto* ctx = reinterpret_cast<StaCtx*>(inst);
     return (ctx && ctx->station) ? (jint)ctx->station->rssiDbm() : -99;
+}
+
+// The dongle's actual DHCP lease IP (host byte order), or 0 if none yet. The VpnService TUN must
+// use THIS as its address — the dongle's ARP responder + CCMP TX identify as the lease IP, so a TUN
+// hardcoded to a different IP (192.168.0.10) makes the VTX unable to ARP/route replies back → SSH
+// times out and aalink ignores the LQ. 0 => caller falls back to the .10 static.
+JNIEXPORT jint JNICALL
+Java_com_openipc_wfbngrtl8812_ApfpvStaLink_nativeStaLeaseIp(JNIEnv*, jclass, jlong inst) {
+    auto* ctx = reinterpret_cast<StaCtx*>(inst);
+    return (ctx && ctx->station) ? (jint)ctx->station->leaseIp() : 0;
 }
 
 JNIEXPORT void JNICALL
@@ -435,6 +488,45 @@ Java_com_openipc_wfbngrtl8812_ApfpvStaLink_nativeStaGetTxPower(JNIEnv*, jclass, 
         return static_cast<jint>(ctx->rtl->GetTxPower());
     }
     return -1;
+}
+
+// ---- General-IP bridge for the ApfpvVpnService TUN (SSH-over-dongle) ---------------------
+// Uplink: TUN → this → station->sendIpPacket (CCMP-encrypt + TX the raw IPv4 datagram).
+JNIEXPORT void JNICALL
+Java_com_openipc_wfbngrtl8812_ApfpvStaLink_nativeStaSendIp(JNIEnv* env, jclass, jlong inst, jbyteArray pkt, jint len) {
+    auto* ctx = reinterpret_cast<StaCtx*>(inst);
+    if (!ctx || !ctx->station || !pkt || len <= 0) return;
+    jbyte* p = env->GetByteArrayElements(pkt, nullptr);
+    if (p) {
+        ctx->station->sendIpPacket(reinterpret_cast<const uint8_t*>(p), (size_t) len);
+        env->ReleaseByteArrayElements(pkt, p, JNI_ABORT);
+    }
+}
+
+// Arm/disarm the downlink: route decrypted general-IP packets to UDP 127.0.0.1:5601 so the
+// VpnService can write them to the TUN. Off = clear the sink (RTP path unaffected either way).
+JNIEXPORT void JNICALL
+Java_com_openipc_wfbngrtl8812_ApfpvStaLink_nativeStaSetIpBridge(JNIEnv*, jclass, jlong inst, jboolean on) {
+    auto* ctx = reinterpret_cast<StaCtx*>(inst);
+    if (!ctx || !ctx->station) return;
+    if (on) {
+        if (ctx->ipDownSock < 0) {
+            ctx->ipDownSock = ::socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+        }
+        int sock = ctx->ipDownSock;
+        StaCtx* c = ctx;
+        ctx->station->setIpSink([c, sock](const uint8_t* ip, size_t n) {
+            if (sock < 0 || !ip || !n) return;
+            sockaddr_in dst{}; dst.sin_family = AF_INET; dst.sin_port = htons(5601);
+            dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            ::sendto(sock, ip, n, MSG_DONTWAIT, (sockaddr*) &dst, sizeof(dst));
+        });
+        LOGI("APFPV IP bridge ARMED (downlink -> udp 127.0.0.1:5601)");
+    } else {
+        ctx->station->setIpSink(nullptr);
+        if (ctx->ipDownSock >= 0) { ::close(ctx->ipDownSock); ctx->ipDownSock = -1; }
+        LOGI("APFPV IP bridge disarmed");
+    }
 }
 
 } // extern "C"

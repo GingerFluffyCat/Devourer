@@ -25,6 +25,32 @@
 #include "RadioManagementModule.h"
 #include <algorithm>
 #include <cstring>
+#if defined(__ANDROID__)
+#include <sys/system_properties.h>
+#endif
+
+namespace {
+// Android has no settable process env, so DEVOURER_* getenv knobs never fire in the app. Mirror the
+// key streaming knobs to `debug.pixelpilot.*` props (adb setprop, no root). Returns true if the prop
+// exists and is not "0". Host builds (no __ANDROID__) always return false → env-only there.
+static bool apfpvProp(const char* name) {
+#if defined(__ANDROID__)
+    char v[PROP_VALUE_MAX] = {0};
+    if (__system_property_get(name, v) > 0 && v[0] != '0') return true;
+#else
+    (void)name;
+#endif
+    return false;
+}
+// ACCEPT the AP's BlockAck (arm RX-BA regs + ADDBA-init + StatusCode 0) instead of declining.
+// Env DEVOURER_ENABLE_BA (host) or `debug.pixelpilot.ba=1` (adb setprop, Android). THE fundamental-fix
+// test: now that FW_RA makes the AP actively aggregate A-MPDU to us, does accepting BA make the chip's
+// MAC auto-emit the SIFS compressed BlockAck so the AP retransmits lost subframes → losses recovered
+// (no more reference-corruption freeze)? Prior sessions tested this only when the AP WASN'T aggregating.
+static bool enableBaOn() {
+    return std::getenv("DEVOURER_ENABLE_BA") != nullptr || apfpvProp("debug.pixelpilot.ba");
+}
+} // namespace
 // Platform-agnostic: <android/log.h> is the NDK header on Android and the
 // compat stderr shim on native host builds (see WiFiDriver/compat), so the same
 // diagnostics surface on Windows/Linux too — essential for chasing parity.
@@ -192,7 +218,7 @@ void ApfpvStation::apOnRx(const uint8_t* f, size_t len, uint8_t rssiRaw) {
 // monitor path doesn't provide. Setting MSR=AP even stops the injected beacon from radiating
 // (HW expects beacons from its own queue). Station mode is the production path; do NOT expose
 // AP mode until the AP-mode HW driver path is ported. Kept here as in-progress scaffolding.
-void ApfpvStation::startAp(const std::string& ssid, int channel, const std::string& password) {
+void ApfpvStation::startAp(const std::string& ssid, int channel, const std::string& password, bool forceHwBeacon) {
     stopAp(); stopBeaconCal(); disconnect();
     if (!_rtl || !_dev) return;
     auto* rtl = reinterpret_cast<RtlJaguarDevice*>(_rtl);
@@ -224,28 +250,45 @@ void ApfpvStation::startAp(const std::string& ssid, int channel, const std::stri
             [this](const Packet& p){ apOnRx(p.Data.data(), p.Data.size(), p.RxAtrib.rssi[0]); }, sc);
     } catch (...) { return; }
     dev->rtw_write8(0x0522, 0x00);
-    // EXPERIMENTAL (opt-in via DEVOURER_AP_HWACK) AP/master HW config — FORCEACK + MSR=AP to
-    // auto-ACK clients. OFF by default: MSR=AP currently stops the injected beacon from
-    // radiating (the HW expects beacons from its own queue), so default startAp keeps the
-    // visible beacon + RSSI tracking working. Part of the WIP AP-mode HW bring-up.
-    if (std::getenv("DEVOURER_AP_HWACK")) {
+    // Full AP/master HW bring-up (opt-in via DEVOURER_AP_HWACK). The Jaguar1 (8812AU) path — the
+    // one PR #227 upstream marks "unsupported" — is the SOFTWARE-BEACON mode: MSR=AP + ENSWBCN
+    // (REG_CR bit8) makes the MAC transmit a host-injected beacon at TBTT and auto-ACK clients.
+    // The beacon MUST be queued to the BEACON queue (QSEL 0x10, StationFrameKind::Beacon) — the
+    // mgmt queue (0x12) is not radiated once MSR=AP, which is exactly why the old default died.
+    // Register map from aircrack rtl8812au include/hal_com_reg.h (verified addresses/bits).
+    const bool hwAp = forceHwBeacon || std::getenv("DEVOURER_AP_HWACK") != nullptr;
+    if (hwAp) {
         for (int i = 0; i < 4; ++i) dev->rtw_write8(REG_MACID + i, self[i]);
         dev->rtw_write16(REG_MACID + 4, (uint16_t)(self[4] | (self[5] << 8)));
         for (int i = 0; i < 4; ++i) dev->rtw_write8(REG_BSSID + i, self[i]);
         dev->rtw_write16(REG_BSSID + 4, (uint16_t)(self[4] | (self[5] << 8)));
-        dev->rtw_write8(MSR, (uint8_t)((dev->rtw_read8(MSR) & 0x0C) | 0x03));  // MSR = AP
+        dev->rtw_write8(MSR, (uint8_t)((dev->rtw_read8(MSR) & 0x0C) | 0x03));  // MSR = AP (MSR_AP)
         dev->rtw_write32(REG_RCR, RCR_APM | RCR_AM | RCR_AB | RCR_ADF | RCR_ACF |
                                   RCR_APP_ICV | RCR_AMF | RCR_HTC_LOC_CTRL | RCR_APP_MIC |
                                   RCR_APP_PHYST_RXFF | RCR_APPFCS | FORCEACK);
+        // ---- Beacon-related registers (hal_com_reg.h) --------------------------------------
+        dev->rtw_write8 (0x0553, 0x01);           // REG_DUAL_TSF_RST: pulse-reset the TSF timer
+        dev->rtw_write16(0x0554, 100);            // REG_BCN_INTERVAL = 100 TU
+        dev->rtw_write16(0x0510, 0x660F);         // REG_BCNTCFG (standard)
+        dev->rtw_write8 (0x0558, 0x05);           // REG_DRVERLYINT (driver early int, ~5 TU)
+        dev->rtw_write8 (0x0559, 0x02);           // REG_BCNDMATIM  (beacon DMA time)
+        dev->rtw_write8 (0x055A, 0x02);           // REG_ATIMWND    (ATIM window, 2 TU)
+        // ENSWBCN = BIT8 of REG_CR(0x0100) => set BIT0 of 0x0101. Enables SW-beacon TX at TBTT.
+        dev->rtw_write8 (0x0101, (uint8_t)(dev->rtw_read8(0x0101) | 0x01));
+        // REG_BCN_CTRL(0x0550): EN_BCN_FUNCTION(0x08)|EN_TXBCN_RPT(0x04)|DIS_BCNQ_SUB(0x02).
+        // DIS_TSF_UDT left CLEAR so the AP's own TSF free-runs (it owns the BSS clock).
+        dev->rtw_write8 (0x0550, 0x0E);
+        SCANLOG("AP HW-beacon armed: MSR=AP ENSWBCN=1 BCN_CTRL=0x0e interval=100TU (Jaguar1 SW-beacon path)");
     }
 
     auto beacon = BuildBeacon(self, ssid, (uint8_t)channel, _apWpa2);
     _apRun.store(true); _beaconRun.store(true);
-    _beaconThread = std::thread([this, dev, beacon]() {
+    _beaconThread = std::thread([this, dev, beacon, hwAp]() {
         std::vector<uint8_t> frame(40 + beacon.size(), 0);
         std::memcpy(frame.data()+40, beacon.data(), beacon.size());
+        // In HW-AP mode queue to the BEACON queue (QSEL 0x10); else the legacy visible-beacon path.
         FillStationTxDesc(frame.data(), (uint16_t)beacon.size(), 40, 0,
-                          StationFrameKind::BroadcastMgmt, 0, 0x04);
+                          hwAp ? StationFrameKind::Beacon : StationFrameKind::BroadcastMgmt, 0, 0x04);
         while (_beaconRun.load()) {
             dev->rtw_write8(0x0522, 0x00);
             try { dev->send_packet(frame.data(), frame.size()); } catch (...) {}
@@ -258,6 +301,23 @@ void ApfpvStation::startAp(const std::string& ssid, int channel, const std::stri
 
 void ApfpvStation::stopAp() {
     _apRun.store(false);
+    // STOP the beacon TX thread FIRST and join it. Previously stopAp cleared _apRun but NOT
+    // _beaconRun, so the beacon thread kept calling send_packet into a device being torn down →
+    // the bulk-OUT endpoint jammed (USBDEVFS_BULK OUT failed: -1) and stayed wedged until a
+    // physical replug. Joining here guarantees no TX is in flight before we tear the HW down.
+    _beaconRun.store(false);
+    if (_beaconThread.joinable()) { try { _beaconThread.join(); } catch (...) {} }
+    // Tear down the AP HW-beacon state so the MAC stops auto-transmitting from the beacon queue
+    // (ENSWBCN + REG_BCN_CTRL) and drop out of master mode. Leaving these set keeps the TX engine
+    // busy → wedge. Best-effort (device may already be gone); registers per hal_com_reg.h.
+    if (_dev) {
+        auto* dev = reinterpret_cast<RtlUsbAdapter*>(_dev);
+        try {
+            dev->rtw_write8(0x0550, 0x00);                                        // REG_BCN_CTRL: beacon func OFF
+            dev->rtw_write8(0x0101, (uint8_t)(dev->rtw_read8(0x0101) & ~0x01));   // clear ENSWBCN (REG_CR bit8)
+            dev->rtw_write8(MSR, (uint8_t)(dev->rtw_read8(MSR) & 0x0C));          // MSR -> NoLink
+        } catch (...) {}
+    }
     stopBeaconCal();
     if (_rtl) { try { reinterpret_cast<RtlJaguarDevice*>(_rtl)->StopAsyncRx(); } catch (...) {} }  // else hangs on exit
     _apAuth.reset();
@@ -279,6 +339,14 @@ void ApfpvStation::ensurePmk() {
                              reinterpret_cast<const uint8_t*>(_params.ssid.data()),
                              _params.ssid.size());
     _pmkValid.store(true);
+}
+
+// DOWNLINK sink setter. Stores the sink AND applies it to the live RxDeframe if the RX loop
+// is already up — so the VpnService can arm/disarm the bridge at runtime (after connect), not
+// only before. (connect() also re-applies _ipSink once _rx exists.)
+void ApfpvStation::setIpSink(OnRtpFn fn) {
+    _ipSink = std::move(fn);
+    if (_rx) _rx->setIpSink(_ipSink);
 }
 
 // UPLINK general-IP: CCMP-encrypt + TX an arbitrary IPv4 datagram (SSH, any TCP/UDP) the
@@ -345,6 +413,120 @@ std::string ApfpvStation::httpGet(uint32_t dstIp, uint16_t port, const std::stri
     sendIpPacket(fin.data(), fin.size());                                            // FIN|ACK (polite close)
     _ipCapture.store(false);
     return resp;
+}
+
+// ---- raw bidirectional TCP (relay transport for SSH over the dongle) --------------------
+// Parse an inbound IPv4 packet and, if it belongs to the active connection (from _tcDst:_tcDport
+// to us:_tcSport, TCP), extract its seq/flags/payload.
+bool ApfpvStation::matchTcp(const std::vector<uint8_t>& pk, uint32_t& seq, uint8_t& flags,
+                            const uint8_t*& payload, size_t& plen) {
+    if (pk.size() < 40 || pk[9] != 6) return false;                        // IPv4 TCP
+    uint32_t s = ((uint32_t)pk[12]<<24)|((uint32_t)pk[13]<<16)|((uint32_t)pk[14]<<8)|pk[15];
+    if (s != _tcDst) return false;
+    size_t ihl = (size_t)(pk[0]&0xf)*4; if (pk.size() < ihl + 20) return false;
+    const uint8_t* t = pk.data() + ihl;
+    uint16_t sp = (uint16_t)((t[0]<<8)|t[1]), dp = (uint16_t)((t[2]<<8)|t[3]);
+    if (sp != _tcDport || dp != _tcSport) return false;
+    seq = ((uint32_t)t[4]<<24)|((uint32_t)t[5]<<16)|((uint32_t)t[6]<<8)|t[7];
+    flags = t[13];
+    size_t toff = (size_t)(t[12]>>4)*4;
+    payload = t + toff;
+    plen = (pk.size() > ihl + toff) ? (pk.size() - ihl - toff) : 0;
+    return true;
+}
+
+bool ApfpvStation::tcpConnect(uint32_t dstIp, uint16_t dport, int timeoutMs) {
+    if (!_rx || !_dhcp || !_dhcp->lease().valid) return false;
+    _tcSrc = _dhcp->lease().ip; _tcDst = dstIp; _tcDport = dport;
+    _tcSport = 0xC351;                                   // ephemeral src port 50001
+    _tcSeq = 2000; _tcAck = 0; _tcOpen = false;
+    { std::lock_guard<std::mutex> lk(_ipQMtx); _ipQ.clear(); }
+    _ipCapture.store(true);
+    _rx->setIpSink([this](const uint8_t* p, size_t n){
+        if (!_ipCapture.load()) return;
+        std::lock_guard<std::mutex> lk(_ipQMtx); _ipQ.emplace_back(p, p + n);
+    });
+    auto syn = buildTcp(_tcSrc,_tcDst,_tcSport,_tcDport,_tcSeq,0,0x02,nullptr,0);
+    sendIpPacket(syn.data(), syn.size());
+    using namespace std::chrono; auto t0 = steady_clock::now(); auto tRetx = t0;
+    while (steady_clock::now() - t0 < milliseconds(timeoutMs)) {
+        if (steady_clock::now() - tRetx > milliseconds(400)) {         // SYN retransmit (userspace TX drops)
+            sendIpPacket(syn.data(), syn.size()); tRetx = steady_clock::now();
+        }
+        std::vector<std::vector<uint8_t>> batch;
+        { std::lock_guard<std::mutex> lk(_ipQMtx); batch.swap(_ipQ); }
+        for (auto& pk : batch) {
+            uint32_t seq; uint8_t flags; const uint8_t* pl; size_t pn;
+            if (!matchTcp(pk, seq, flags, pl, pn)) continue;
+            if ((flags & 0x12) == 0x12) {                // SYN|ACK
+                _tcAck = seq + 1;                        // ack their SYN
+                _tcSeq += 1;                             // our SYN consumed a seq
+                auto ack = buildTcp(_tcSrc,_tcDst,_tcSport,_tcDport,_tcSeq,_tcAck,0x10,nullptr,0);
+                sendIpPacket(ack.data(), ack.size());
+                _tcOpen = true; return true;
+            }
+            if (flags & 0x04) { fprintf(stderr, "[tcp] RST from %u.%u.%u.%u:%u — port closed\n",
+                (_tcDst>>24)&255,(_tcDst>>16)&255,(_tcDst>>8)&255,_tcDst&255,_tcDport);
+                _ipCapture.store(false); return false; }   // RST
+        }
+        std::this_thread::sleep_for(milliseconds(3));
+    }
+    fprintf(stderr, "[tcp] no SYN|ACK from %u.%u.%u.%u:%u within timeout\n",
+            (_tcDst>>24)&255,(_tcDst>>16)&255,(_tcDst>>8)&255,_tcDst&255,_tcDport);
+    _ipCapture.store(false); return false;
+}
+
+int ApfpvStation::tcpPoll(std::string& out, int timeoutMs) {
+    if (!_tcOpen) return -1;
+    using namespace std::chrono; auto t0 = steady_clock::now(); int appended = 0;
+    do {
+        std::vector<std::vector<uint8_t>> batch;
+        { std::lock_guard<std::mutex> lk(_ipQMtx); batch.swap(_ipQ); }
+        for (auto& pk : batch) {
+            uint32_t seq; uint8_t flags; const uint8_t* pl; size_t pn;
+            if (!matchTcp(pk, seq, flags, pl, pn)) continue;
+            if (flags & 0x04) { _tcOpen = false; return appended > 0 ? appended : -1; }   // RST
+            if (pn) {
+                if (seq == _tcAck) {                     // in-order data
+                    out.append((const char*)pl, pn);
+                    _tcAck += (uint32_t)pn; appended += (int)pn;
+                }
+                // in-order or duplicate: (re-)ACK so the peer advances / retransmits
+                auto ack = buildTcp(_tcSrc,_tcDst,_tcSport,_tcDport,_tcSeq,_tcAck,0x10,nullptr,0);
+                sendIpPacket(ack.data(), ack.size());
+            }
+            if ((flags & 0x01) && seq + (uint32_t)pn == _tcAck) {           // FIN (in order)
+                _tcAck += 1;
+                auto fa = buildTcp(_tcSrc,_tcDst,_tcSport,_tcDport,_tcSeq,_tcAck,0x11,nullptr,0);
+                sendIpPacket(fa.data(), fa.size());
+                _tcOpen = false; return appended > 0 ? appended : -1;
+            }
+        }
+        if (appended > 0) return appended;
+        std::this_thread::sleep_for(milliseconds(2));
+    } while (steady_clock::now() - t0 < milliseconds(timeoutMs));
+    return 0;
+}
+
+bool ApfpvStation::tcpSend(const uint8_t* data, size_t n) {
+    if (!_tcOpen || !n) return false;
+    size_t off = 0;
+    while (off < n) {
+        size_t chunk = (n - off > 1024) ? 1024 : (n - off);
+        auto seg = buildTcp(_tcSrc,_tcDst,_tcSport,_tcDport,_tcSeq,_tcAck,0x18,data+off,chunk);
+        sendIpPacket(seg.data(), seg.size());
+        _tcSeq += (uint32_t)chunk; off += chunk;
+    }
+    return true;
+}
+
+void ApfpvStation::tcpClose() {
+    if (_tcOpen) {
+        auto fin = buildTcp(_tcSrc,_tcDst,_tcSport,_tcDport,_tcSeq,_tcAck,0x11,nullptr,0);
+        sendIpPacket(fin.data(), fin.size());
+        _tcSeq += 1; _tcOpen = false;
+    }
+    _ipCapture.store(false);
 }
 
 static uint16_t ipChecksum(const uint8_t* p, size_t n) {
@@ -582,6 +764,7 @@ bool ApfpvStation::runConnectChain() {
     if (bad) { self.b[0]=0x02; self.b[1]=0x11; self.b[2]=0x22;
                self.b[3]=0x33; self.b[4]=0x44; self.b[5]=0x55; }
     ensurePmk();   // precompute the PBKDF2 PMK now (cached) so becomeStation is instant
+    dev.setTxFastPath(false);  // connect handshake wants the per-TX drain diag; Streaming flips it true
 
     // DISCOVERY: scan beacons for the SSID -> BSSID + channel + negotiated RSN.
     // Removes the hardcoded-channel / empty-BSSID / fixed-cipher assumptions
@@ -743,7 +926,7 @@ bool ApfpvStation::runConnectChain() {
     // entry 4 keyed to the AP BSSID/keyid0; GTK (bcast) → entry 5. RxDeframe skips SW decrypt for
     // bdecrypted frames (same default). Fixed 2026-07-14: SECCFG 0x010c + _params.bssid populated
     // → bdecrypted=4000/4000 verified. DEVOURER_NO_HW_DECRYPT reverts to the SW path.
-    if (std::getenv("DEVOURER_NO_HW_DECRYPT") == nullptr) {
+    if (std::getenv("DEVOURER_HW_DECRYPT") != nullptr || apfpvProp("debug.pixelpilot.hwdec")) {   // HW-decrypt arms the HW reorder + compressed-BA (rig: loss 163→21). Needs RCR_APP for correct framing (debug.pixelpilot.rcrapp). `debug.pixelpilot.hwdec=1` on Android.
         const auto& tk = _wpa->tk();
         dev.setSecCamKey(4, _params.bssid.data(), 0, tk.data());          // PTK pairwise, keyid 0
         if (_wpa->gtkKeyId() != 0xff) {
@@ -761,7 +944,7 @@ bool ApfpvStation::runConnectChain() {
     // throughput loss on an A-MPDU-on AP (measured Taiga: 8 -> 22 median / 35 peak Mbps when
     // BA is declined instead). Opt back into the old BA-initiating + BA-register path with
     // DEVOURER_ENABLE_BA (e.g. to re-test the HW auto-BA hypothesis on a kernel-matched AP).
-    if (std::getenv("DEVOURER_ENABLE_BA")) {
+    if (enableBaOn()) {
         // REG_AMPDU_MIN_SPACE: the kernel does NOT write this (leaves chip default). We forced
         // 7 = 16µs min MPDU spacing, which over-restricts the AP's downlink A-MPDU packing (at
         // high MCS a 1.5KB frame is <16µs, so 16µs spacing pads/caps the aggregate → the ~30Mbps
@@ -785,6 +968,33 @@ bool ApfpvStation::runConnectChain() {
                 dev.rtw_write16(0x06A2, (uint16_t)(fm | 0x0700)); // BIT8 BAR | BIT9 BA | BIT10 PS-Poll
                 SCANLOG("RXFLTMAP1 0x06A2 before=%04x BAR_bit8=%d -> after=%04x (forced BAR+BA)",
                         fm, (fm>>8)&1, dev.rtw_read16(0x06A2));
+            }
+            // ITERATION (2026-07-16 bench: userspace 6.57% incomplete-frames vs kernel 0.08%). Match
+            // the kernel's RUNTIME BA-register values devourer STILL differs on (from the 30s head-to-
+            // head mac_reg diff). Gated DEVOURER_BAREGS_K for clean A/B on the bench rig.
+            if (std::getenv("DEVOURER_BAREGS_K") || apfpvProp("debug.pixelpilot.baregsk")) {
+                dev.rtw_write16(0x06A2, 0x0520);       // RXFLTMAP1: kernel=0x0520 (block above forces 0x0700)
+                dev.rtw_write32(0x0458, 0x8001ffff);   // REG_AMPDU_MAX_LENGTH: kernel runtime (D was 0xffff0180)
+                dev.rtw_write8(0x0463, 0x03);          // REG_RD_RESP_PKT_TH: kernel lowered 0x05->0x03 at connect
+                SCANLOG("BAREGS_K: RXFLTMAP1=%04x AMPDU_MAXLEN=%08x RD_RESP_TH=%02x",
+                        dev.rtw_read16(0x06A2), (unsigned)dev.rtw_read32(0x0458), dev.rtw_read8(0x0463));
+            }
+            // MATCH ALL kernel RUNTIME value-diffs (from the 30s mac_reg readback diff) that devourer
+            // differs on — these are VALUE diffs on registers BOTH write, so the address-level usbmon
+            // diff missed them. Hunting the compressed-BA arm. Gated DEVOURER_KVALS for A/B + bisect.
+            if (std::getenv("DEVOURER_KVALS") || apfpvProp("debug.pixelpilot.kvals")) {
+                dev.rtw_write32(0x0434, 0x07040302);   // (kernel runtime; D=0x07050302)
+                dev.rtw_write32(0x045c, 0x1000f700);   // REG_WMAC_LBK / RD region (D=0x1000f900)
+                dev.rtw_write32(0x0460, 0x03086666);   // (D=0x05086666)
+                dev.rtw_write32(0x047c, 0x03030002);   // (D=0x0000000c/d)
+                dev.rtw_write32(0x0480, 0xa40c0420);   // REG_INIRTS_RATE_SEL (D=0xa40c0400)
+                dev.rtw_write32(0x04bc, 0x00040040);   // REG_AMPDU_BURST_MODE (D=0x0004005f)
+                dev.rtw_write32(0x04f0, 0x0000c100);   // REG_TX_RPT_TIME (D=0x04014100)
+                dev.rtw_write32(0x0524, 0x21ff4f0f);   // REG_RD_CTRL region (D=0x21ff4fff)
+                dev.rtw_write32(0x0544, 0x00400180);   // REG_RD_NAV_NXT (D=0x00400200)
+                SCANLOG("KVALS applied: 0x04bc=%08x 0x0480=%08x 0x0524=%08x 0x047c=%08x",
+                        (unsigned)dev.rtw_read32(0x04bc), (unsigned)dev.rtw_read32(0x0480),
+                        (unsigned)dev.rtw_read32(0x0524), (unsigned)dev.rtw_read32(0x047c));
             }
             // ★★ TEST 3 (DEVOURER_T3_WAKE): MACID sleep/wake state — a HW state machine we never
             // drove. The kernel calls rtw_hal_macid_wakeup(psta->mac_id) on join. If our AP-peer
@@ -898,7 +1108,15 @@ bool ApfpvStation::runConnectChain() {
     // sends issue_addba_req to initiate the BA session; the AP responds and starts
     // A-MPDU. Sending the request AFTER keys are installed ensures it's encrypted
     // (QoS-data). The response handler in RxDeframe's dispatch catches the reply.
-    {
+    //
+    // ⚠️ GATED behind DEVOURER_ENABLE_BA (was unconditional — the throughput REGRESSION).
+    // This dongle's MAC cannot emit the SIFS compressed BlockAck ([[apfpv-hw-blockack-fix]],
+    // proven CLOSED). If we ASK the AP to start A-MPDU, the AP aggregates frames we can't ACK
+    // -> AP retransmits -> the VTX rate-controller collapses to the MCS floor (rate=12/20MHz ~=
+    // 2-3.9 Mbps). Declining/never-initiating BA keeps the stream non-aggregated -> the rate
+    // controller ramps to high MCS -> ~33 Mbps. So by default we must NOT initiate BA here;
+    // it belongs with the same env gate as the BA-register block above.
+    if (enableBaOn()) {
         MacAddr bssid; for (int i=0;i<6;i++) bssid.b[i] = _params.bssid[i];
         std::vector<uint8_t> addba;
         // 802.11 QoS-Data header (subtype 8, ToDS, Protected)
@@ -1008,6 +1226,11 @@ bool ApfpvStation::runConnectChain() {
     _deauth.store(false);
     _lastRxMs.store(nowMs());
     set(State::Streaming);
+    // Streaming: make station TX fire-and-forget. The per-TX REG_TXPKT_EMPTY drain poll
+    // in sendStationFrameSync is a connect-time diagnostic (~6ms/call); during streaming
+    // the LQ-feedback loop hits it ~90-100x/s (~560ms/s of blocking) -> RX starves ->
+    // decode/render stutter on the phone. send_packet already blocked on the bulk write.
+    dev.setTxFastPath(true);
     // ADDBA Requests are answered directly in handleAddbaRequest (raw-fd TX),
     // which also covers requests arriving during streaming — no connect-time
     // batch/pause needed.
@@ -1098,7 +1321,7 @@ void ApfpvStation::handleAddbaRequest(const uint8_t* frame, size_t len) {
     // 37 (REFUSED) forces the AP to stop aggregating this TID, trading aggregation gain we
     // can't use for a clean non-aggregated stream (no PN-replay). DEVOURER_ENABLE_BA accepts
     // (StatusCode 0) to restore the old behavior.
-    const bool declineBa = std::getenv("DEVOURER_ENABLE_BA") == nullptr;
+    const bool declineBa = !enableBaOn();
     r.push_back(0x03); r.push_back(0x01); r.push_back(dialog);
     if (declineBa) { r.push_back(37); r.push_back(0x00); }      // StatusCode = 37 (REFUSED)
     else           { r.push_back(0x00); r.push_back(0x00); }    // StatusCode = 0 (success)
@@ -1168,8 +1391,16 @@ void ApfpvStation::supervisorLoop() {
             // TEST 1 (DEVOURER_T1_QUIET): make the supervisor fully silent during streaming —
             // no uplink ARP TX, no H2C, no diagnostic control-reads — so NOTHING of ours contends
             // with the RX/BA path on the USB bus. Tests the "flushing frames out of the HW" thesis.
-            const bool t1quiet = std::getenv("DEVOURER_T1_QUIET") != nullptr;
-            static const int kaEvery = std::getenv("DEVOURER_KEEPALIVE") ? 1 : 10;
+            // `debug.pixelpilot.quiet=1` (adb setprop) also enables it on Android, where env vars
+            // aren't settable — for testing whether our periodic supervisor TX (ARP + H2C RA/RSSI)
+            // is stalling the single RX worker and dropping bursts of video (the dongle-only freeze).
+            const bool t1quiet = std::getenv("DEVOURER_T1_QUIET") != nullptr || apfpvProp("debug.pixelpilot.quiet");
+            // ARP re-announce cadence. Was 10 (1s) — but the gratuitous ARP is a SYNCHRONOUS
+            // bulk-OUT that briefly starves the single RX worker, and at 1Hz that periodic stall
+            // dropped a burst of video every ~1s (the "stutter every few seconds" on the dongle;
+            // phone-Wi-Fi has no such TX so it was smoother). 30 (3s) keeps the AP's ARP entry for
+            // us fresh (ARP timeout is tens of seconds) while cutting the periodic RX stall 3x.
+            static const int kaEvery = std::getenv("DEVOURER_KEEPALIVE") ? 1 : 30;
             if (++gratTick >= kaEvery) { gratTick = 0; if (_gratArp && !t1quiet) _gratArp(); }  // re-announce ARP (keep AP entry fresh)
             // PERIODIC RA/RSSI H2C (~1Hz, matching the kernel usbmon cadence). The kernel re-sends
             // H2C 0x40 (RA/MACID) + 0x42 (RSSI) every ~1s during streaming to keep the firmware's
@@ -1215,7 +1446,12 @@ void ApfpvStation::supervisorLoop() {
                         }
                     } catch (...) {}
                 }
-                try {
+                // ⚠️ THESE DIAGNOSTIC REGISTER READS ARE DEBUG-ONLY AND DEFAULT OFF. They ran EVERY
+                // 100ms loop = ~8 USB control reads x10/s = ~80 control transfers/s, all contending
+                // with the SINGLE libusb RX worker → continuous RX starvation (video quality
+                // degradation) on the dongle (phone-Wi-Fi, which has no such traffic, was smoother).
+                // Enable with DEVOURER_RXDIAG when debugging the RX/rate path.
+                if (std::getenv("DEVOURER_RXDIAG")) try {
                     uint16_t rxpktnum = dd.rtw_read16(0x0284);
                     // IGI (RX gain index) — PHYDM/DIG output. Path A = 0xc50[6:0], Path B = 0xe50[6:0].
                     // Kernel adapts this to ~0x37 (55) at rssi -45. If OURS is parked far off (DIG not

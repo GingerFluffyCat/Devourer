@@ -4,6 +4,11 @@
 // (apfpv_jni.cpp ensureStation + nativeStaConnect), and prints the state funnel.
 // Used to capture the STATION-path TX in usbmon and find why the auth gets no reply.
 //   Build: cmake + make ApfpvProbe.  Run: DEVOURER_PID=0x881a ./ApfpvProbe
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#endif
 #include "WiFiDriver.h"
 #include "RtlJaguarDevice.h"
 #include "RtlUsbAdapter.h"
@@ -23,6 +28,50 @@ static const char* stateName(int s) {
         "FailDhcp","LinkLost","Reconnecting"};
     return (s >= 0 && s < 15) ? n[s] : "?";
 }
+
+#ifdef _WIN32
+// Local TCP relay: plink connects to 127.0.0.1:<localPort>, we bridge raw bytes to the VTX's
+// dropbear (:22) over the dongle's devourer TCP stack. This is the "SSH over the dongle" path —
+// no PC network route to the VTX needed. Runs on the main thread for up to runSecs.
+static void runSshProxy(apfpv::ApfpvStation& station, uint32_t vtx, uint16_t dport, int localPort, int runSecs) {
+    WSADATA w; if (WSAStartup(MAKEWORD(2,2), &w)) { printf("[sshproxy] WSAStartup fail\n"); return; }
+    SOCKET ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    BOOL yes = 1; setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (char*)&yes, sizeof(yes));
+    sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons((u_short)localPort);
+    a.sin_addr.s_addr = htonl(0x7f000001);   // 127.0.0.1
+    if (bind(ls, (sockaddr*)&a, sizeof(a)) || listen(ls, 1)) {
+        printf("[sshproxy] bind/listen fail %d\n", WSAGetLastError()); closesocket(ls); WSACleanup(); return;
+    }
+    printf("[sshproxy] listening 127.0.0.1:%d  ->  VTX:%u over the dongle (%ds window)\n",
+           localPort, dport, runSecs); fflush(stdout);
+    auto tEnd = std::chrono::steady_clock::now() + std::chrono::seconds(runSecs);
+    while (std::chrono::steady_clock::now() < tEnd) {
+        fd_set rf; FD_ZERO(&rf); FD_SET(ls, &rf); timeval tv{1, 0};
+        if (select(0, &rf, nullptr, nullptr, &tv) <= 0) continue;
+        SOCKET cs = accept(ls, nullptr, nullptr);
+        if (cs == INVALID_SOCKET) continue;
+        printf("[sshproxy] client connected; SYN -> VTX:%u\n", dport); fflush(stdout);
+        if (!station.tcpConnect(vtx, dport, 5000)) { printf("[sshproxy] tcpConnect FAILED\n"); closesocket(cs); continue; }
+        printf("[sshproxy] VTX TCP established; relaying\n"); fflush(stdout);
+        u_long nb = 1; ioctlsocket(cs, FIONBIO, &nb);
+        bool open = true; long upBytes = 0, downBytes = 0; const char* why = "window";
+        while (open && std::chrono::steady_clock::now() < tEnd) {
+            char buf[2048];
+            int r = recv(cs, buf, sizeof(buf), 0);
+            if (r > 0)       { station.tcpSend((const uint8_t*)buf, (size_t)r); upBytes += r; }
+            else if (r == 0) { why = "client-FIN"; break; }           // client closed
+            else if (WSAGetLastError() != WSAEWOULDBLOCK) { why = "client-err"; break; }
+            std::string down; int got = station.tcpPoll(down, 20);
+            if (!down.empty()) { send(cs, down.data(), (int)down.size(), 0); downBytes += (long)down.size(); }
+            if (got < 0) { open = false; why = "vtx-close"; }         // VTX closed
+        }
+        station.tcpClose();
+        closesocket(cs);
+        printf("[sshproxy] session ended (%s) up=%ld down=%ld bytes\n", why, upBytes, downBytes); fflush(stdout);
+    }
+    closesocket(ls); WSACleanup();
+}
+#endif
 
 int main(int argc, char** argv) {
     auto logger = std::make_shared<Logger>();
@@ -58,7 +107,16 @@ int main(int argc, char** argv) {
         int si = (int)s;
         if (si != last.exchange(si)) { printf("STATE -> %d (%s)\n", si, stateName(si)); fflush(stdout); }
     };
-    auto onRtp = [](const uint8_t*, size_t) {};
+    // APFPV_RTP_DUMP=/path → append raw RTP payloads (rig video-validity check: parse H265 NAL types
+    // to confirm HW-decrypt produces decodable H.265, not mangled bytes).
+    FILE* rtpDump = nullptr;
+    if (const char* p = std::getenv("APFPV_RTP_DUMP")) rtpDump = std::fopen(p, "wb");
+    auto onRtp = [rtpDump](const uint8_t* d, size_t n) {
+        if (rtpDump && d && n && n < 65536) {   // length-prefixed (2B BE) so we can split packets offline
+            uint8_t len[2] = { (uint8_t)(n >> 8), (uint8_t)(n & 0xff) };
+            std::fwrite(len, 1, 2, rtpDump); std::fwrite(d, 1, n, rtpDump); std::fflush(rtpDump);
+        }
+    };
 
     apfpv::ApfpvStation station(&rtl->adapter(), &rtl->radioManager(), onRtp, onState);
     station.setDevice(rtl.get());
@@ -89,7 +147,42 @@ int main(int argc, char** argv) {
 
     int secs = 25;
     if (const char* s = std::getenv("APFPV_SECONDS")) secs = atoi(s);
-    std::this_thread::sleep_for(std::chrono::seconds(secs));
+    // APFPV_HTTP=<path>: after the link is up, issue an HTTP GET to the VTX (192.168.0.1:80) OVER
+    // THE DONGLE (devourer's own TCP stack) — used to probe the WebUI + drive aalink/bitrate CGIs
+    // without any PC-side network route to the VTX. APFPV_HTTP_PORT overrides the port.
+    if (const char* hp = std::getenv("APFPV_HTTP")) {
+        std::this_thread::sleep_for(std::chrono::seconds(7));   // let it reach STREAMING + get the lease
+        uint32_t vtx = station.leaseServerIp();
+        if (!vtx) vtx = 0xC0A80001u;                            // 192.168.0.1 fallback
+        uint16_t port = 80; if (const char* pp = std::getenv("APFPV_HTTP_PORT")) port = (uint16_t)atoi(pp);
+        printf("=== HTTP GET '%s' -> %u.%u.%u.%u:%u (over dongle) ===\n",
+               hp, (vtx>>24)&255,(vtx>>16)&255,(vtx>>8)&255,vtx&255, port); fflush(stdout);
+        std::string resp = station.httpGet(vtx, port, hp, 6000);
+        printf("=== HTTP RESP (%zu bytes) ===\n%s\n=== END HTTP ===\n",
+               resp.size(), resp.substr(0, 1500).c_str()); fflush(stdout);
+        int rem = secs - 7; if (rem > 0) std::this_thread::sleep_for(std::chrono::seconds(rem));
+    } else if (const char* sp = std::getenv("APFPV_SSHPROXY")) {
+#ifdef _WIN32
+        // Wait for the DHCP lease (tcpConnect needs it) — up to 40s — instead of a fixed sleep.
+        uint32_t vtx = 0;
+        for (int i = 0; i < 80; ++i) {
+            vtx = station.leaseServerIp();
+            if (station.leaseIp() && vtx) { printf("[sshproxy] lease up (ip=%u.%u.%u.%u) after %ds\n",
+                (station.leaseIp()>>24)&255,(station.leaseIp()>>16)&255,(station.leaseIp()>>8)&255,station.leaseIp()&255, i/2); fflush(stdout); break; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+        if (!vtx) vtx = 0xC0A80001u;
+        int lport = atoi(sp); if (lport <= 0) lport = 2222;
+        uint16_t dport = 22; if (const char* dp = std::getenv("APFPV_SSHPROXY_DPORT")) dport = (uint16_t)atoi(dp);
+        int runSecs = secs > 10 ? secs - 8 : 30;
+        runSshProxy(station, vtx, dport, lport, runSecs);
+#else
+        printf("APFPV_SSHPROXY only supported on Windows\n");
+        std::this_thread::sleep_for(std::chrono::seconds(secs));
+#endif
+    } else {
+        std::this_thread::sleep_for(std::chrono::seconds(secs));
+    }
 
     station.disconnect();
     evtRun = false;

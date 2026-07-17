@@ -69,12 +69,20 @@ public:
     // GENERAL-IP BRIDGE (for an Android VpnService TUN). setIpSink: downlink — receives the
     // full decrypted IPv4 packet (SSH / any TCP+UDP), making the dongle a full L3 interface
     // (not RTP-only). sendIpPacket: uplink — CCMP-encrypts + TXes an arbitrary IPv4 datagram.
-    void setIpSink(OnRtpFn fn) { _ipSink = std::move(fn); }
+    void setIpSink(OnRtpFn fn);   // propagates to _rx immediately (so arming after connect works)
     bool sendIpPacket(const uint8_t* ip, size_t len);
     // Minimal TCP/HTTP client over the link — PROVES the dongle carries general TCP, so SSH
     // and REST/HTTP (same transport) work over it. Real SYN/SYN-ACK/ACK + "GET <path>" to
     // dstIp:port; returns the response (empty on failure). Blocking; call after Streaming.
     std::string httpGet(uint32_t dstIp, uint16_t port, const std::string& path, int timeoutMs = 4000);
+    // Raw bidirectional TCP over the link — enough to relay a whole SSH session (a local
+    // socket listener in the host harness bridges plink <-> here). Minimal in-order stack:
+    // accepts only in-order segments (the peer retransmits its own losses), ACKs everything,
+    // segments uplink at a conservative MSS. Call only after Streaming, one connection at a time.
+    bool tcpConnect(uint32_t dstIp, uint16_t dport, int timeoutMs = 4000);
+    int  tcpPoll(std::string& out, int timeoutMs);   // >=0 = bytes appended; -1 = peer closed (FIN/RST)
+    bool tcpSend(const uint8_t* data, size_t n);
+    void tcpClose();
     uint32_t leaseIp() const;       // our DHCP IP (0 if none)
     uint32_t leaseServerIp() const; // DHCP server / gateway (the VTX analog)
 
@@ -100,7 +108,9 @@ public:
     // RSSI + has a full WPA2 Authenticator, BUT a client CANNOT complete association (needs the
     // 8812 AP/master HW bring-up: HW beacon queue + TSF + per-station ACK) and the path wedges the
     // USB on exit. Kept as in-progress scaffolding only; see the banner on startAp() in the .cpp.
-    void startAp(const std::string& ssid, int channel, const std::string& password = "");
+    // forceHwBeacon=true enables the Jaguar1 HW software-beacon path (ENSWBCN + MSR=AP + per-STA
+    // ACK) without the DEVOURER_AP_HWACK env var — needed on Android where env vars aren't settable.
+    void startAp(const std::string& ssid, int channel, const std::string& password = "", bool forceHwBeacon = false);
     void stopAp();
     struct ApStation { Mac mac; int rssiDbm; int state; };  // state 4=assoc, 7=authenticated
     std::vector<ApStation> apStations();
@@ -129,6 +139,11 @@ private:
     std::vector<std::vector<uint8_t>> _ipQ;   // httpGet: captured inbound IP packets
     std::mutex _ipQMtx;
     std::atomic<bool> _ipCapture{false};
+    // active raw-TCP connection state (tcpConnect/tcpSend/tcpPoll/tcpClose)
+    uint32_t _tcSrc=0,_tcDst=0; uint16_t _tcSport=0,_tcDport=0;
+    uint32_t _tcSeq=0,_tcAck=0; bool _tcOpen=false;
+    bool matchTcp(const std::vector<uint8_t>& pk, uint32_t& seq, uint8_t& flags,
+                  const uint8_t*& payload, size_t& plen);
     std::function<void()> _gratArp;           // re-announce our IP<->MAC (keeps unicast RTP alive)
     // RX pipeline (lives across the connection so the device callback stays valid)
     std::unique_ptr<class RxDeframe> _rx;

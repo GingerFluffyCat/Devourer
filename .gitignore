@@ -6,3 +6,6 @@ __pycache__/
 build-win/
 build-linux/
 *.bak
+build-wsl/
+build-linux/
+build-win/

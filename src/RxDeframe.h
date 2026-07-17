@@ -44,7 +44,7 @@ private:
     int      _dbgRx = 0, _dbgDrop = 0;
     // RX-health instrumentation (logged to logcat tag "rxd-health"): decrypt failures + RTP-seq-gap
     // loss, to diagnose dongle jumps/rewinds (loss vs duplication vs decrypt failure).
-    int      _dbgDecFail = 0, _dbgLoss = 0;
+    int      _dbgDecFail = 0, _dbgLoss = 0, _dbgOoo = 0;
     int      _dbgAmsdu = 0, _dbgAmsduSub = 0;   // A-MSDU frames seen + total subframes de-aggregated
     uint16_t _lastSeq[128] = {};
     bool     _lastSeqV[128] = {};
@@ -57,12 +57,19 @@ private:
     struct ReorderCtl {
         bool     enable = false;
         uint16_t indicate_seq = 0xffff;  // next expected seq (mod 4096)
-        uint8_t  wsize_b = 64;            // window size in frames
+        uint16_t wsize_b = 64;           // window size in frames (USB needs > kernel's BA bufsz 64)
         std::map<uint16_t, std::vector<uint8_t>> pending; // seq -> plaintext frame
+        int64_t  lastFlushMs = 0;        // kernel reorder release-timer: force-flush a stuck gap
     };
     ReorderCtl _reorder[16];  // one per TID (0-15)
     // Process a decrypted QoS-data frame through the reorder buffer for TID `tid`.
     // Delivers frames in-order via onRtpFn. Returns true if delivered, false if queued/dropped.
     bool processReorder(uint8_t tid, uint16_t seq, const uint8_t* llc, size_t llcLen);
+    // Kernel rtw_process_bar_frame: on a BlockAckReq, advance the reorder window to start_seq
+    // (flush everything below it). Keeps the SW reorder from stalling when the AP moves on.
+    void processBar(uint8_t tid, uint16_t start_seq);
+    // Emit one MSDU's RTP payload to _onRtp (shared by direct + reorder paths).
+    void emitReorderRtp(const uint8_t* llc, size_t llcLen);
+    bool _reorderOn = false;  // gated: DEVOURER_REORDER / debug.pixelpilot.reorder
 };
 }
