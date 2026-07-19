@@ -14,6 +14,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <chrono>
+#include <functional>
 #if defined(_WIN32)
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -41,6 +42,7 @@ struct LqState {
     std::atomic<bool> run{false};
     std::thread th;
     std::mutex m; std::condition_variable cv; bool fresh = false;
+    std::function<void(const char*, int)> sink;  // if set, route emit here (dongle IP TX) not the socket
 };
 
 // Single global map would be needed for many instances; APFPV uses one link,
@@ -63,6 +65,7 @@ int LqFeedback::rssiPct(int dbm) {
 
 LqFeedback::LqFeedback() { g.cfg = Config{}; }
 LqFeedback::LqFeedback(Config cfg) { g.cfg = cfg; }
+void LqFeedback::setSink(std::function<void(const char*, int)> fn) { g.sink = std::move(fn); }
 
 static void emit(double& sA, double& sB, bool& init) {
     int a = g.a.load(), b = g.b.load();
@@ -79,14 +82,18 @@ static void emit(double& sA, double& sB, bool& init) {
         n = std::snprintf(buf, sizeof(buf), "gs_string=gs rssi_a = %d(%%), rssi_b = %d(%%)\n", pctA, pctB);
     else
         n = std::snprintf(buf, sizeof(buf), "gs_string=gs rssi_a = %d(%%)\n", pctA);
-    if (n > 0 && g.sock >= 0)
-        ::sendto(g.sock, buf, (size_t)n, 0, (sockaddr*)&g.dst, sizeof(g.dst));
+    if (n > 0) {
+        if (g.sink) g.sink(buf, n);
+        else if (g.sock >= 0) ::sendto(g.sock, buf, (size_t)n, 0, (sockaddr*)&g.dst, sizeof(g.dst));
+    }
     // Also send the BARE percentage that the phone-Wi-Fi path uses (ApfpvWifiManager sends
     // Integer.toString(pct)) — that variant is confirmed to move the VTX downlink %, whereas the
     // verbose "gs_string=" form above may not parse on the current aalink. Belt-and-suspenders.
     char bare[16]; int bn = std::snprintf(bare, sizeof(bare), "%d", pctA);
-    if (bn > 0 && g.sock >= 0)
-        ::sendto(g.sock, bare, (size_t)bn, 0, (sockaddr*)&g.dst, sizeof(g.dst));
+    if (bn > 0) {
+        if (g.sink) g.sink(bare, bn);
+        else if (g.sock >= 0) ::sendto(g.sock, bare, (size_t)bn, 0, (sockaddr*)&g.dst, sizeof(g.dst));
+    }
 #if defined(__ANDROID__)
     // DIAGNOSTIC: surface the RSSI→pct we are actually sending (rules out a 0-value RSSI conversion).
     static int dbgN = 0;
@@ -120,11 +127,16 @@ bool LqFeedback::start(const char* airIp, uint16_t port) {
     // the connect chain re-runs without stop()). Move-assigning g.th below while
     // it is still joinable calls std::terminate(). Tear the old one down first.
     if (g.th.joinable()) stop();
-    g.sock = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (g.sock < 0) return false;
-    std::memset(&g.dst, 0, sizeof(g.dst));
-    g.dst.sin_family = AF_INET; g.dst.sin_port = htons(port);
-    ::inet_pton(AF_INET, airIp, &g.dst.sin_addr);
+    // When a sink is set (libusb dongle path), emit routes through it — no host socket needed.
+    // The host ::socket() also needs WSAStartup on Windows (only run lazily elsewhere), so a
+    // socket-open failure must NOT prevent the emit thread from starting.
+    if (!g.sink) {
+        g.sock = ::socket(AF_INET, SOCK_DGRAM, 0);
+        if (g.sock < 0) return false;
+        std::memset(&g.dst, 0, sizeof(g.dst));
+        g.dst.sin_family = AF_INET; g.dst.sin_port = htons(port);
+        ::inet_pton(AF_INET, airIp, &g.dst.sin_addr);
+    }
     g.run = true;
     g.th = std::thread(g.cfg.mode == Mode::FixedTimer ? loopFixed : loopFrameDriven);
     return true;

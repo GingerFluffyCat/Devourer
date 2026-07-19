@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <functional>
 namespace apfpv {
 class LqFeedback {
 public:
@@ -15,6 +16,10 @@ public:
     LqFeedback() ; explicit LqFeedback(Config cfg);
     ~LqFeedback() { stop(); }   // join thread + close socket on destroy (reconnect-safe)
     bool start(const char* airIp = "192.168.0.1", uint16_t port = 12345);
+    // Route each LQ datagram through the caller instead of a host UDP socket. Needed on the
+    // libusb dongle path (Win/WSL): the host has NO route to the VTX, so ::sendto dead-ends;
+    // the sink lets ApfpvStation TX the payload over the dongle's own IP stack (sendIpPacket).
+    void setSink(std::function<void(const char* buf, int len)> fn);
     void stop();
     void update(int rssiA_dbm, int rssiB_dbm = INT32_MIN);
 };

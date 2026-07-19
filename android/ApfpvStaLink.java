@@ -50,7 +50,9 @@ public class ApfpvStaLink {
         FAIL_NO_ACK,       // NOGO_Deauthed             (hardware won't auto-ACK)
         FAIL_AUTH,         // wrong passphrase / 4-way failed
         FAIL_DHCP,         // associated but no IP
-        LINK_LOST          // mid-flight deauth/disassoc
+        LINK_LOST,         // mid-flight deauth/disassoc
+        RECONNECTING       // supervisor re-arming (native State::Reconnecting=14) — MUST match
+                           // the native enum length or values()[14] throws on every reconnect
     }
 
     public interface StaStatusListener {

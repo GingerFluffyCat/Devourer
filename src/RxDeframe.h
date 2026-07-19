@@ -70,6 +70,23 @@ private:
     void processBar(uint8_t tid, uint16_t start_seq);
     // Emit one MSDU's RTP payload to _onRtp (shared by direct + reorder paths).
     void emitReorderRtp(const uint8_t* llc, size_t llcLen);
+    // RTP-SEQUENCE reorder: the depacketizer consumes UDP/5600 RTP in arrival order, but the
+    // dongle's USB/A-MPDU delivery hands packets up OUT of RTP-seq order. Re-keying the reorder
+    // on the 802.11 MPDU seq was WRONG for this VTX (A-MSDU/constant MPDU seq) — it buffered
+    // ~everything and skipped more than it delivered (rxd-reo: buffered>>inOrder, farSkip>>0),
+    // which is net-harmful. The unit the depacketizer actually needs in order is the RTP seq, so
+    // buffer the RTP payload keyed by its 16-bit seq and emit strictly in order. Returns true if
+    // delivered (in order or recovered), false if queued/old.
+    bool processReorderRtp(uint16_t rtpSeq, const uint8_t* rtp, size_t rtpLen);
+    // Per-stream RTP-seq reorder state (mod 65536). One slot: the single :5600 video flow.
+    struct RtpReorderCtl {
+        bool     enable = false;
+        uint16_t indicate = 0;            // next expected RTP seq
+        int      wsize = 256;             // ~4 video frames of slack for the bursty USB delivery
+        std::map<uint16_t, std::vector<uint8_t>> pending; // rtpSeq -> payload
+        int64_t  lastFlushMs = 0;
+    };
+    RtpReorderCtl _reorderRtp{};
     bool _reorderOn = false;  // gated: DEVOURER_REORDER / debug.pixelpilot.reorder
 };
 }

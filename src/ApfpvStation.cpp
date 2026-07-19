@@ -18,6 +18,9 @@
 #include "FrameParser.h"
 #include "ScanProbe.h"
 #include "LqFeedback.h"
+#if defined(__ANDROID__)
+#include <sys/system_properties.h>
+#endif
 #include "PhydmWatchdog.h"
 #include "RtlUsbAdapter.h"
 #include "RtlJaguarDevice.h"
@@ -359,7 +362,7 @@ bool ApfpvStation::sendIpPacket(const uint8_t* ip, size_t len) {
     std::vector<uint8_t> frame(40 + mpdu.size(), 0);          // 40 = 8812 TX desc
     std::memcpy(frame.data() + 40, mpdu.data(), mpdu.size());
     apfpv::FillStationTxDesc(frame.data(), (uint16_t)mpdu.size(), 40,
-                             0, apfpv::StationFrameKind::CcmpData, 0, 0x04);
+                             1, apfpv::StationFrameKind::CcmpData, 7, 0x04);
     return dev->sendStationFrameSync(frame.data(), frame.size());
 }
 
@@ -578,6 +581,24 @@ static std::vector<uint8_t> buildTcp(uint32_t srcIp, uint32_t dstIp, uint16_t sp
     return p;
 }
 
+// Build an IPv4 + UDP datagram (UDP checksum 0 = optional in v4). Used to carry the LQ-feedback
+// percentage to the VTX aalink over the dongle's own IP stack (see the LqFeedback sink) — the host
+// socket path can't reach the VTX on the libusb (Win/WSL) dongle path.
+static std::vector<uint8_t> buildUdp(uint32_t srcIp, uint32_t dstIp, uint16_t sport, uint16_t dport,
+                                     const uint8_t* payload, size_t plen) {
+    size_t udpLen = 8 + plen, ipLen = 20 + udpLen;
+    std::vector<uint8_t> p(ipLen, 0);
+    p[0]=0x45; p[2]=(uint8_t)(ipLen>>8); p[3]=(uint8_t)(ipLen&0xff); p[8]=64; p[9]=17;  // proto UDP
+    p[12]=(uint8_t)(srcIp>>24);p[13]=(uint8_t)(srcIp>>16);p[14]=(uint8_t)(srcIp>>8);p[15]=(uint8_t)srcIp;
+    p[16]=(uint8_t)(dstIp>>24);p[17]=(uint8_t)(dstIp>>16);p[18]=(uint8_t)(dstIp>>8);p[19]=(uint8_t)dstIp;
+    uint16_t ick = ipChecksum(p.data(), 20); p[10]=(uint8_t)(ick>>8); p[11]=(uint8_t)(ick&0xff);
+    uint8_t* u = p.data()+20;
+    u[0]=(uint8_t)(sport>>8);u[1]=(uint8_t)sport;u[2]=(uint8_t)(dport>>8);u[3]=(uint8_t)dport;
+    u[4]=(uint8_t)(udpLen>>8);u[5]=(uint8_t)(udpLen&0xff);   // UDP length; checksum left 0 (optional)
+    if (plen) std::memcpy(u+8, payload, plen);
+    return p;
+}
+
 // The gated establishment chain (arm -> auth -> assoc -> WPA2 -> DHCP -> stream).
 // Returns true only on a held, streaming link. Used for both initial connect
 // AND each supervisor reconnect attempt.
@@ -607,6 +628,12 @@ bool ApfpvStation::runConnectChain() {
                           : _params.bandwidth >= 40 ? CHANNEL_WIDTH_40
                           : CHANNEL_WIDTH_20;
     if (std::getenv("DEVOURER_FORCE_20MHZ")) userBw = CHANNEL_WIDTH_20;
+    // Arm at the AP's ACTUAL width/center. This is why 80 MHz worked but 40/20 didn't: at 80 MHz
+    // the station tuned to center 42 and MATCHED the AP, so it RXed the AP's HT/VHT data — incl.
+    // the EAPOL M1 — and the 4-way completed. Arming narrower (center 36/38) than the AP's real
+    // operating width mis-captures its aggregated data frames -> M1 missed -> handshake times out.
+    // Wide-center arming only ever failed because the IQK wedged the synth; IQK is now disabled,
+    // so we can (and must) match the AP's width here. DEVOURER_FORCE_20MHZ still forces 20 for A/B.
     sta.setConnectWidth(userBw);
     MacAddr self{}, bssid{};
     // NOTE: our MAC is read from REG_MACID AFTER the device is brought up (below).
@@ -713,16 +740,15 @@ bool ApfpvStation::runConnectChain() {
         // WFB-style bandwidth from the start: use user-selected bw, not hardcoded 20.
         // The kernel's init_hw_mlme_ext does the same — sets cur_bwmode before auth.
         uint8_t initCh = (uint8_t)(_params.channel > 0 ? _params.channel : 40);
-        ChannelWidth_t initBw = _params.bandwidth >= 80 ? CHANNEL_WIDTH_80
-                              : _params.bandwidth >= 40 ? CHANNEL_WIDTH_40
-                              : CHANNEL_WIDTH_20;
-        if (std::getenv("DEVOURER_FORCE_20MHZ")) initBw = CHANNEL_WIDTH_20;
+        // ALWAYS bring up at the 20 MHz primary. The Init runs an IQK on the init channel;
+        // at a 40/80 MHz center (e.g. ch36@40 -> center 38) that IQK wedges the RF synth
+        // (RF_CH=0xea) and — critically — the wedge PERSISTS across app restarts AND survives
+        // USBDEVFS_RESET (only a physical replug clears it). After the first assoc adopts the
+        // AP's 40 MHz, _params.bandwidth=40, so a bandwidth-driven initBw would re-wedge on
+        // every reconnect. Keep every IQK at a 20 MHz center; the real width is applied
+        // post-handshake (same channel, no band change -> no fresh IQK -> no wedge).
+        ChannelWidth_t initBw = CHANNEL_WIDTH_20;
         uint8_t initOff = 0;
-        if (initBw == CHANNEL_WIDTH_40) {
-            // WFB offset rule: LOWER members of 40MHz pairs -> offset LOWER (1), else UPPER (2)
-            if (initCh > 14) initOff = ((initCh / 4) & 1) ? 1 /*LOWER*/ : 2 /*UPPER*/;
-            else             initOff = (initCh <= 7) ? 1 : 2;
-        }
         SelectedChannel initSel{ .Channel=initCh, .ChannelOffset=initOff, .ChannelWidth=initBw };
         if (std::getenv("DEVOURER_SYNC_IO")) {
             // LEGACY blocking sync RX loop (monopolises libusb -> async TX can't
@@ -746,6 +772,43 @@ bool ApfpvStation::runConnectChain() {
         auto t0 = steady_clock::now();
         while (!_rxReady.load() && steady_clock::now() - t0 < seconds(4))
             std::this_thread::sleep_for(milliseconds(50));
+
+        // ---- RF-WEDGE AUTO-RECOVERY ----------------------------------------
+        // A full cold software re-init (power-on + hw_reset + firmware + PHY/RF
+        // tables) runs every bring-up but does NOT clear an RF-synth wedge (RF
+        // 0x18 reads 0xea -> can't tune ANY channel -> scan finds nothing / auth
+        // TX fails). Proven on-device. The only lever left short of a physical
+        // replug is a USB port reset (USBDEVFS_RESET), which cycles the chip's
+        // reset the way VBUS removal does. On detecting the wedge, reset + re-init
+        // and re-check, up to a few times. Gate off with DEVOURER_NO_USB_RESET.
+        if (!std::getenv("DEVOURER_NO_USB_RESET")) {
+            // USBDEVFS_RESET (the only USB reset reachable via the Java-wrapped fd) is a
+            // protocol reset, NOT a VBUS power-cycle — proven on-device to NOT clear an
+            // existing RF wedge (rc=0 but RF_CH stays 0xea). So this is best-effort only;
+            // the real fix is prevention (all IQK at 20 MHz centers). 1 attempt by default.
+            int maxTries = 1;
+            if (const char* e = std::getenv("DEVOURER_USB_RESET_TRIES")) maxTries = atoi(e);
+            for (int attempt = 1; attempt <= maxTries && rm.rf_wedged(); ++attempt) {
+                SCANLOG("RF WEDGED (RF_CH=0xea) after bring-up -> USB port reset attempt %d/%d",
+                        attempt, maxTries);
+                rtl->StopAsyncRx();
+                std::this_thread::sleep_for(milliseconds(50));
+                int rc = dev.reset_device();   // libusb_reset_device / USBDEVFS_RESET
+                SCANLOG("USB reset_device() rc=%d (0=ok; <0 = libusb err, fd likely re-enumerated)", rc);
+                std::this_thread::sleep_for(milliseconds(300));  // let the chip re-appear
+                _rxPhase.store(0); _rxReady.store(false);
+                try { rtl->StartMonitorAsyncRx(dispatch, initSel); }   // full re-init on the reset chip
+                catch (...) { SCANLOG("re-init after USB reset threw (fd invalid?) — bailing"); break; }
+                auto tr = steady_clock::now();
+                while (!_rxReady.load() && steady_clock::now() - tr < seconds(4))
+                    std::this_thread::sleep_for(milliseconds(50));
+                SCANLOG("post-reset bring-up: rf_wedged=%d", rm.rf_wedged() ? 1 : 0);
+            }
+            if (rm.rf_wedged())
+                SCANLOG("RF STILL WEDGED after %d USB resets — likely needs a physical replug", maxTries);
+        }
+        // --------------------------------------------------------------------
+
         // TX POWER: the station auth/assoc TX uses the same chip/PA the beacon-cal
         // (startBeaconCal -> SetTxPower) and the verified-working monitor injection
         // (txdemo SetTxPower(40)) drive — but the connect path NEVER set it, so the
@@ -781,7 +844,9 @@ bool ApfpvStation::runConnectChain() {
         set(State::Scanning);
         // Sweep beacons for the SSID -> BSSID + channel + negotiated RSN (now works:
         // the RX thread feeds frames while this thread hops channels).
+        rm.setScanMode(true);   // suppress IQK during the hop (band-cross IQK wedges the RF -> found=0)
         ap = sta.scanForSsid(_params.ssid.c_str(), _params.channel, /*ms*/300);
+        rm.setScanMode(false);  // arm channel gets a clean, settled IQK below
         SCANLOG("scan: \"%s\" found=%d ch=%d", _params.ssid.c_str(), ap.found?1:0, ap.channel);
         if (!ap.found) { set(State::FailNoAp); return false; }
         bssid.b = ap.bssid;
@@ -828,28 +893,10 @@ bool ApfpvStation::runConnectChain() {
         case StationMode::Result::Error:             set(State::FailNoAp);  return false;
         case StationMode::Result::GO_LinkHeld: break;
     }
-    // ⭐ POST-ASSOC BANDWIDTH UPGRADE: the pre-arm tune (above) dropped the radio to 20 MHz for
-    // a clean auth/assoc, and nothing re-tuned it afterward — so the radio stayed at 20 MHz and
-    // we could only RX the 20 MHz primary (rxd-health bw=0, VHT 2SS capped ~104 Mbps PHY). The
-    // AP also matches our 20 MHz. Re-tune to the negotiated width (80 MHz) now that assoc is up,
-    // so the HW receives the full 80 MHz A-MPDU (bw=2) — the kernel runs at 80 MHz here (867 Mbps).
-    // CRITICAL: set_channel_bwmode runs the IQK, which needs CLEAN control I/O — the 16 in-flight
-    // RX URBs (and the PHYDM watchdog's BB reads) contend with the IQK loopback over libusb and
-    // make it FAIL (A_done=0, retry=10), leaving the 80 MHz radio mis-calibrated so the AP falls
-    // back to 20 MHz. Pause RX around the retune exactly like arm() does for its IQK.
-    if (_params.bandwidth >= 80 && !std::getenv("DEVOURER_FORCE_20MHZ")) {
-        dev.pauseAsyncRx();
-        rm.set_channel_bwmode((uint8_t)_params.channel, 0, CHANNEL_WIDTH_80);
-        dev.resumeAsyncRx();
-        SCANLOG("post-assoc: radio -> 80 MHz on ch%d (RX paused for clean IQK)", (int)_params.channel);
-    } else if (_params.bandwidth >= 40 && !std::getenv("DEVOURER_FORCE_20MHZ")) {
-        uint8_t c = (uint8_t)_params.channel;
-        uint8_t off = (c > 14) ? (((c / 4) & 1) ? 1 : 2) : ((c <= 7) ? 1 : 2);
-        dev.pauseAsyncRx();
-        rm.set_channel_bwmode(c, off, CHANNEL_WIDTH_40);
-        dev.resumeAsyncRx();
-        SCANLOG("post-assoc: radio -> 40 MHz on ch%d (RX paused for clean IQK)", (int)_params.channel);
-    }
+    // BANDWIDTH UPGRADE is DEFERRED until AFTER the 4-way handshake completes (see below,
+    // right after _wpa->ready()). Auth, assoc AND the 4-way all run at the 20 MHz primary:
+    // retuning to 40/80 here — right before the AP fires M1 — disrupts RX during the
+    // ~4 s EAPOL window so M1/M3 are missed and the handshake times out (state 5 -> 11).
     set(State::Handshaking);
     // ONE supplicant (member), used for handshake + RX decrypt + encrypted TX.
     Mac selfMac{}, bss{};
@@ -863,8 +910,11 @@ bool ApfpvStation::runConnectChain() {
     auto wpaSend = [&dev](const std::vector<uint8_t>& mpdu) -> bool {
         std::vector<uint8_t> frame(40 + mpdu.size(), 0);          // 40 = 8812 TX desc
         std::memcpy(frame.data() + 40, mpdu.data(), mpdu.size());
+        // Use the MGMT TX descriptor (macid=1, raid=7) like auth/assoc — PROVEN to radiate
+        // on this chip+USB path. CcmpData with macid=0/raid=0 drains the FIFO but never
+        // goes on-air (verified via VTX hostapd: assoc seen, M2 never received).
         apfpv::FillStationTxDesc(frame.data(), (uint16_t)mpdu.size(), 40,
-                                 /*macid*/0, apfpv::StationFrameKind::CcmpData, /*raid*/0, /*rate*/0x04);
+                                 /*macid*/1, apfpv::StationFrameKind::Mgmt, /*raid*/7, /*rate*/0x04);
         return dev.sendStationFrameSync(frame.data(), frame.size());
     };
     _wpa = std::make_unique<Wpa2Supplicant>(MakeWpa2Crypto(), wpaSend);
@@ -881,15 +931,45 @@ bool ApfpvStation::runConnectChain() {
         if (mpdu.empty()) return false;
         std::vector<uint8_t> frame(40 + mpdu.size(), 0);   // 40 = 8812 TX desc
         std::memcpy(frame.data()+40, mpdu.data(), mpdu.size());
+        // macid=1, raid=7 like auth/assoc — the only TX path proven to radiate on
+        // this chip. macid=0 is special/reserved on Jaguar and drains the FIFO silently.
         apfpv::FillStationTxDesc(frame.data(), (uint16_t)mpdu.size(), 40,
-                                 0, apfpv::StationFrameKind::CcmpData, 0, 0x04);
+                                 1, apfpv::StationFrameKind::CcmpData, 7, 0x04);
         return sendFrame(frame);
     };
     _dhcp = std::make_unique<ApfpvDhcp>(self.b, dhcpSend);
 
     // Register the RX path NOW so EAPOL (handshake) and DHCP replies actually
     // reach the supplicant / DHCP machine before we wait on them.
-    if (_params.lqFeedback) { _lq = std::make_unique<LqFeedback>(LqFeedback::Config{});
+    if (_params.lqFeedback) { LqFeedback::Config lqcfg{};
+                              if (const char* e = std::getenv("DEVOURER_LQ_MS")) { int ms = std::atoi(e);
+                                  if (ms > 0) { lqcfg.send_interval_ms = ms; lqcfg.min_interval_ms = ms; } }
+                              _lq = std::make_unique<LqFeedback>(lqcfg);
+                              // Route LQ over the dongle's IP stack — OPT-IN (DEVOURER_LQ_DONGLE). Default OFF:
+                              // the periodic CCMP TX from the LQ thread collapses the dongle RX during streaming
+                              // (bitrate -> ~0.3 Mbps on Win + Android; OUT serialises behind the IN pipeline),
+                              // and greg's aalink (air_man) is disabled anyway so the feedback does nothing. When
+                              // off, LqFeedback falls back to the (harmless, dead-ending) host socket. Enable only
+                              // when air_man/adaptive-bitrate is running AND the TX/RX serialisation is solved.
+                              bool lqDongle;
+#if defined(__ANDROID__)
+                              { char v[8]={0}; __system_property_get("persist.pixelpilot.lqdongle", v);
+                                lqDongle = (v[0] != '0'); }   // default ON; `setprop persist.pixelpilot.lqdongle 0` disables
+#else
+                              lqDongle = (std::getenv("DEVOURER_LQ_DONGLE") != nullptr);
+#endif
+                              if (lqDongle)
+                              _lq->setSink([this](const char* b, int n){
+                                  uint32_t src = (_dhcp && _dhcp->lease().valid) ? _dhcp->lease().ip
+                                                                                 : 0xC0A8000Au; // 192.168.0.10
+                                  auto pkt = buildUdp(src, 0xC0A80001u /*192.168.0.1*/, 0xC351, 12345,
+                                                      reinterpret_cast<const uint8_t*>(b), (size_t)n);
+                                  bool ok = sendIpPacket(pkt.data(), pkt.size());
+                                  static int lqDbg = 0;
+                                  if ((lqDbg++ % 30) == 0)
+                                      std::fprintf(stderr, "[lq-tx] -> 192.168.0.1:12345 payload='%.*s' srcIp=%08x ok=%d\n",
+                                                   n, b, src, (int)ok);
+                              });
                               _lq->start("192.168.0.1", 12345); }
     _rx = std::make_unique<RxDeframe>(selfMac, bss, _wpa.get(), _lq.get(), _onRtp);
     _rx->setStation(this);
@@ -917,6 +997,19 @@ bool ApfpvStation::runConnectChain() {
             std::this_thread::sleep_for(milliseconds(20));
         }
     }
+
+    // Bandwidth already set correctly by the arm (sta.setConnectWidth matches the
+    // AP's negotiated width). Running pauseAsyncRx/resumeAsyncRx here — even when
+    // set_channel_bwmode is a no-op — disrupts RX exactly when data starts flowing,
+    // causing the "black screen + inactivity timeout" pattern. The pause/resume was
+    // historically needed for IQK control-I/O isolation; IQK is now disabled by
+    // default, so there is no reason to touch the RX pipeline here.
+
+    // Enable fire-and-forget TX NOW (before LQ/DHCP start). The per-TX TXPKT_EMPTY
+    // drain in sendStationFrameSync blocks the USB bus for ~100ms each call, and LQ
+    // fires ~1/s + DHCP retransmits — starving RX with 100ms gaps (rx-gap log storm).
+    // send_packet already blocks on the bulk write; the drain is a connect diagnostic.
+    dev.setTxFastPath(true);
 
     // ⭐ Lever C.2 (kernel-parity HW CCMP decrypt) — DEFAULT ON (2026-07-14). The chip decrypts RX
     // in hardware so the single RX worker just de-aggregates + forwards plaintext (the kernel's
@@ -1205,7 +1298,7 @@ bool ApfpvStation::runConnectChain() {
             std::vector<uint8_t> fr(40 + m.size(), 0);
             std::memcpy(fr.data()+40, m.data(), m.size());
             apfpv::FillStationTxDesc(fr.data(), (uint16_t)m.size(), 40,
-                                     0, apfpv::StationFrameKind::CcmpData, 0, 0x04);
+                                     1, apfpv::StationFrameKind::CcmpData, 7, 0x04);
             dev.sendStationFrameSync(fr.data(), fr.size());
         };
         for (int k=0;k<3;++k) _gratArp();                 // announce now
@@ -1214,7 +1307,7 @@ bool ApfpvStation::runConnectChain() {
             std::vector<uint8_t> fr(40 + mpdu.size(), 0);
             std::memcpy(fr.data()+40, mpdu.data(), mpdu.size());
             apfpv::FillStationTxDesc(fr.data(), (uint16_t)mpdu.size(), 40,
-                                     0, apfpv::StationFrameKind::CcmpData, 0, 0x04);
+                                     1, apfpv::StationFrameKind::CcmpData, 7, 0x04);
             dev.sendStationFrameSync(fr.data(), fr.size());
         });
     }

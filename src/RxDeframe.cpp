@@ -30,12 +30,16 @@ static bool rxHwDecryptOn() {
 }
 
 static bool reorderEnabledInit() {
-    if (std::getenv("DEVOURER_REORDER") != nullptr) return true;
+    // DEFAULT ON: deliver RTP strictly in-order to :5600 like the kernel does for phone-wifi.
+    // The dongle's USB/A-MPDU delivery is bursty/out-of-order; without this the app's parser sees
+    // gaps -> drops reference NALUs -> long-GOP decoder freeze (the dongle-only stutter). Opt out
+    // with DEVOURER_REORDER=0 or debug.pixelpilot.reorder=0.
+    if (const char* e = std::getenv("DEVOURER_REORDER")) return e[0] != '0';
 #if defined(__ANDROID__)
     char v[PROP_VALUE_MAX] = {0};
-    if (__system_property_get("debug.pixelpilot.reorder", v) > 0 && v[0] != '0') return true;
+    if (__system_property_get("debug.pixelpilot.reorder", v) > 0) return v[0] != '0';
 #endif
-    return false;
+    return true;
 }
 
 RxDeframe::RxDeframe(const Mac& self, const Mac& bssid, Wpa2Supplicant* wpa,
@@ -94,7 +98,13 @@ void RxDeframe::onPacket(const Packet& pkt) {
     if (((fc >> 2) & 0x3) == 0x0) {
         uint8_t sub = (fc >> 4) & 0xF;
         if (sub == 0xC || sub == 0xA) {
-            if (_station) { // deauth/disassoc from AP -> immediate link-loss
+            // ONLY honor a deauth/disassoc that is addressed to US (a1==self) AND sent by
+            // OUR AP (a2==bssid). Without this, in busy RF we overhear OTHER APs deauthing
+            // THEIR clients and falsely trip link-loss -> a Reconnecting churn every few
+            // seconds -> periodic video stutter. (Same a1/a2 filter the join path uses.)
+            bool toUs   = (std::memcmp(f + 4,  _self.data(),  6) == 0);
+            bool fromAp = (std::memcmp(f + 10, _bssid.data(), 6) == 0);
+            if (_station && toUs && fromAp) { // deauth/disassoc from AP -> immediate link-loss
                 if (!_wpa || !_wpa->pmfActive() || _wpa->verifyProtectedMgmt(f, len))
                     _station->notifyDeauth();
             }
@@ -161,6 +171,25 @@ void RxDeframe::onPacket(const Packet& pkt) {
     // broadcast and FPV video may be multicast. Group frames decrypt with the GTK below.
     if (!(f[4] & 0x01) && std::memcmp(f + 4, _self.data(), 6) != 0) return;
 
+    // Count data frames arriving, log every 500th
+    static thread_local uint32_t dataFrames = 0;
+    static thread_local bool firstData = true;
+    if (firstData) {
+        firstData = false;
+#if defined(__ANDROID__)
+        __android_log_print(ANDROID_LOG_INFO, "apfpv-scan",
+            "1st data frame: fc=0x%04x len=%zu prot=%d a1=%02x:%02x:%02x:%02x:%02x:%02x",
+            fc, len, (fc&0x4000)?1:0, f[4],f[5],f[6],f[7],f[8],f[9]);
+#endif
+    }
+    if ((++dataFrames % 500) == 0) {
+#if defined(__ANDROID__)
+        __android_log_print(ANDROID_LOG_INFO, "apfpv-scan",
+            "data frames: %u total, decryptOk=%u decFail=%u",
+            dataFrames, decryptOk, _dbgDecFail);
+#endif
+    }
+
     size_t hdrLen = 24;
     if ((fc & 0x0300) == 0x0300) hdrLen += 6;      // 4-addr
     if (fc & 0x0080) hdrLen += 2;                  // QoS-data (subtype>=8): 2B QoS Control
@@ -206,6 +235,12 @@ void RxDeframe::onPacket(const Packet& pkt) {
             if (!_wpa || !_wpa->ready()) return;
             if (!_wpa->decryptData(f, len, plainBuf)) {
                 _dbgDecFail++;
+#if defined(__ANDROID__)
+                if ((_dbgDecFail % 200) == 1)
+                    __android_log_print(ANDROID_LOG_WARN, "apfpv-scan",
+                        "CCMP decFail count=%u a1=%02x:%02x fc=0x%04x len=%zu",
+                        _dbgDecFail, f[4],f[5], fc, len);
+#endif
                 return;
             }
             decryptOk++;
@@ -223,6 +258,10 @@ void RxDeframe::onPacket(const Packet& pkt) {
     // EAPOL (0x888E): the WPA2 4-way handshake. MUST route to the supplicant or
     // the handshake never completes and the link stalls at Handshaking.
     if (ethertype == 0x888E) {
+#if defined(__ANDROID__)
+        __android_log_print(ANDROID_LOG_INFO, "apfpv-scan",
+            "[rx] EAPOL frame -> supplicant (llcLen=%zu wpa=%d)", llcLen, _wpa?1:0);
+#endif
         if (_wpa) _wpa->onEapolKey(llc + 8, llcLen - 8);
         return;
     }
@@ -359,11 +398,13 @@ void RxDeframe::onPacket(const Packet& pkt) {
     if (ulen < 8 || (size_t)ulen > ipLen - ihl) return;
     const uint8_t* rtp = udp + 8; size_t rtpLen = ulen - 8;
     if (rtpLen && _onRtp) {
-        // DYNAMIC A-MPDU REORDER (kernel port): for QoS-data video, deliver strictly in-order via
-        // the per-TID reorder buffer instead of arrival-order, so the depacketizer (not reorder-
-        // tolerant) stops seeing complete-but-scrambled frames as "missing". Gated _reorderOn.
-        if (_reorderOn && !amsdu && (fc & 0x0080)) {
-            processReorder(qtid, mpduSeq, llc, llcLen);   // emits in order via emitReorderRtp
+        // RTP-SEQUENCE REORDER: deliver the :5600 payload strictly in RTP-seq order so the
+        // depacketizer (not reorder-tolerant) stops seeing scrambled/complete-but-gapped frames.
+        // Keyed on the RTP seq (not the 802.11 MPDU seq — that was wrong for this VTX and buffered
+        // everything). Gated _reorderOn.
+        if (_reorderOn) {
+            uint16_t rtpSeq = (uint16_t)((rtp[2] << 8) | rtp[3]);
+            processReorderRtp(rtpSeq, rtp, rtpLen);
         } else {
             _onRtp(rtp, rtpLen);
         }
@@ -419,16 +460,6 @@ void RxDeframe::emitReorderRtp(const uint8_t* llc, size_t llcLen) {
     _onRtp(u + 8, rtpLen);
 }
 
-// A-MPDU per-TID reorder buffer — faithful port of the kernel's recv_indicatepkt_reorder +
-// rtw_reordering_ctrl_timeout_handler (release timer). QoS-data A-MPDU subframes/retransmits
-// arrive out-of-order; the depacketizer (ParseRTP) is NOT reorder-tolerant, so out-of-order RTP
-// makes it declare complete frames "missing". This delivers strictly in-order within a 64-seq
-// window, with a release-timer flush so a permanently-lost seq skips forward instead of stalling.
-// 12-bit 802.11 sequence space (mod 4096). kReorderTimeoutMs matches the kernel's ~sortterm.
-static int64_t nowMsSteady() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-               std::chrono::steady_clock::now().time_since_epoch()).count();
-}
 // Reorder release-timer: how long to hold a gap waiting for a late/retransmitted seq before
 // skipping it. Too short = skip a recoverable retransmit (residual loss); too long = latency.
 // Env DEVOURER_REORDER_MS to sweep toward kernel parity.
@@ -440,6 +471,82 @@ static int64_t reorderTimeoutMs() {
     return v;
 }
 #define kReorderTimeoutMs reorderTimeoutMs()
+static int64_t nowMsSteady() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// RTP-SEQUENCE reorder for the :5600 video flow. Buffers the RTP payload keyed by its 16-bit
+// (mod 65536) sequence number and emits strictly in order via _onRtp. Mirrors the proven
+// wrap-safe drain of processReorder but in the RTP-seq domain the depacketizer actually needs.
+// A release timer (kReorderTimeoutMs) force-flushes a permanently-missing seq so a lost packet
+// skips forward instead of stalling the drain forever (and leaking the pending map).
+bool RxDeframe::processReorderRtp(uint16_t rtpSeq, const uint8_t* rtp, size_t rtpLen) {
+    auto& rc = _reorderRtp;
+    if (rtpLen == 0 || rtpLen > 1500) return false;
+    int64_t now = nowMsSteady();
+    if (!rc.enable) {
+        rc.enable = true; rc.indicate = rtpSeq; rc.pending.clear();
+        rc.lastFlushMs = now; rc.wsize = 256;
+    }
+    // signed 16-bit distance in [-32768, 32767]
+    auto sdiff = [](uint16_t a, uint16_t b) { int d = ((int)a - (int)b) & 0xffff; return d >= 32768 ? d - 65536 : d; };
+    auto drain = [&]() {
+        for (auto it = rc.pending.find(rc.indicate); it != rc.pending.end();
+             it = rc.pending.find(rc.indicate)) {
+            _onRtp(it->second.data(), it->second.size());
+            rc.pending.erase(it);
+            rc.indicate = (uint16_t)(rc.indicate + 1);
+            rc.lastFlushMs = now;
+        }
+    };
+    auto lowestPending = [&]() -> uint16_t {
+        uint16_t best = rc.indicate; int bestd = 0x7fffffff;
+        for (auto& kv : rc.pending) { int dd = sdiff(kv.first, rc.indicate);
+            if (dd >= 0 && dd < bestd) { bestd = dd; best = kv.first; } }
+        return best;
+    };
+    static long cIn = 0, cBuf = 0, cDrain = 0, cDropOld = 0, cFarJump = 0, cFarSkip = 0, cToFlush = 0, cToSkip = 0, cLog = 0;
+    size_t pendBefore = rc.pending.size();
+
+    int d = sdiff(rtpSeq, rc.indicate);
+    if (d < 0) { cDropOld++; return false; }                       // already passed (dup/retransmit)
+    if (d >= rc.wsize) {                                          // far ahead: shift window, flush below
+        uint16_t newInd = (uint16_t)((rtpSeq - rc.wsize + 1) & 0xffff);
+        cFarJump++; cFarSkip += (long)sdiff(newInd, rc.indicate);
+        while (rc.indicate != newInd) {
+            auto it = rc.pending.find(rc.indicate);
+            if (it != rc.pending.end()) { _onRtp(it->second.data(), it->second.size()); rc.pending.erase(it); }
+            rc.indicate = (uint16_t)(rc.indicate + 1);
+        }
+        rc.lastFlushMs = now; drain(); d = sdiff(rtpSeq, rc.indicate);
+    }
+    if (d == 0) {                                                 // in order
+        cIn++; _onRtp(rtp, rtpLen); rc.indicate = (uint16_t)(rc.indicate + 1); rc.lastFlushMs = now;
+        size_t pb = rc.pending.size(); drain(); cDrain += (long)(pb - rc.pending.size());
+    } else {                                                      // ahead, in window — buffer
+        if (rc.pending.count(rtpSeq) == 0) { rc.pending[rtpSeq] = std::vector<uint8_t>(rtp, rtp + rtpLen); cBuf++; }
+    }
+    // release timer: a gap at indicate_seq persisting past the timeout -> skip the lost seq
+    if (!rc.pending.empty() && (now - rc.lastFlushMs) > kReorderTimeoutMs) {
+        uint16_t lp = lowestPending();
+        cToFlush++; cToSkip += (long)sdiff(lp, rc.indicate);
+        rc.indicate = lp; rc.lastFlushMs = now; drain();
+    }
+    (void)pendBefore;
+    if ((++cLog % 4000) == 0)
+        __android_log_print(ANDROID_LOG_INFO, "rxd-reo",
+            "RTP inOrder=%ld buffered=%zu drained(rec)=%ld dropOld=%ld | farJump=%ld farSkip=%ld | toFlush=%ld toSkip=%ld pend=%zu",
+            cIn, rc.pending.size(), cDrain, cDropOld, cFarJump, cFarSkip, cToFlush, cToSkip, rc.pending.size());
+    return true;
+}
+
+// A-MPDU per-TID reorder buffer — faithful port of the kernel's recv_indicatepkt_reorder +
+// rtw_reordering_ctrl_timeout_handler (release timer). QoS-data A-MPDU subframes/retransmits
+// arrive out-of-order; the depacketizer (ParseRTP) is NOT reorder-tolerant, so out-of-order RTP
+// makes it declare complete frames "missing". This delivers strictly in-order within a 64-seq
+// window, with a release-timer flush so a permanently-lost seq skips forward instead of stalling.
+// 12-bit 802.11 sequence space (mod 4096). kReorderTimeoutMs matches the kernel's ~sortterm.
 
 bool RxDeframe::processReorder(uint8_t tid, uint16_t seq, const uint8_t* llc, size_t llcLen) {
     if (tid >= 16) return false;
@@ -456,14 +563,26 @@ bool RxDeframe::processReorder(uint8_t tid, uint16_t seq, const uint8_t* llc, si
 
     // signed 12-bit distance sq - indicate_seq in [-2048, 2047]
     auto sdiff = [](uint16_t a, uint16_t b) { int d = ((int)a - (int)b) & 0xfff; return d >= 2048 ? d - 4096 : d; };
-    auto drain = [&]() {   // deliver consecutive pending starting at indicate_seq
-        while (!rc.pending.empty() && rc.pending.begin()->first == rc.indicate_seq) {
-            auto it = rc.pending.begin();
+    // Wrap-safe: deliver the EXACT next expected seq via find() — NOT begin() (numeric-min of the
+    // std::map), which returns the wrong entry across the 12-bit seq wrap (~every 0.8s at 120fps).
+    // The old begin()==indicate_seq test stalled the drain whenever a wrapped seq sorted below
+    // indicate_seq, so pending piled up until the far-ahead branch fired and SKIPPED recoverable
+    // frames (the farSkip that made this reorder net-harmful and got it disabled).
+    auto drain = [&]() {
+        for (auto it = rc.pending.find(rc.indicate_seq); it != rc.pending.end();
+             it = rc.pending.find(rc.indicate_seq)) {
             emitReorderRtp(it->second.data(), it->second.size());
-            rc.indicate_seq = (rc.indicate_seq + 1) & 0xfff;
             rc.pending.erase(it);
+            rc.indicate_seq = (rc.indicate_seq + 1) & 0xfff;
             rc.lastFlushMs = now;
         }
+    };
+    // Wrap-safe lowest buffered seq at/ahead of indicate_seq (min non-negative 12-bit distance).
+    auto lowestPending = [&]() -> uint16_t {
+        uint16_t best = rc.indicate_seq; int bestd = 0x7fffffff;
+        for (auto& kv : rc.pending) { int dd = sdiff(kv.first, rc.indicate_seq);
+            if (dd >= 0 && dd < bestd) { bestd = dd; best = kv.first; } }
+        return best;
     };
 
     // DIAG counters to find WHERE the residual loss comes from.
@@ -477,14 +596,13 @@ bool RxDeframe::processReorder(uint8_t tid, uint16_t seq, const uint8_t* llc, si
         // strictly in order first (so nothing is emitted out-of-order), then the frame is in-window.
         uint16_t newInd = (uint16_t)((sq - rc.wsize_b + 1) & 0xfff);
         cFarJump++; cFarSkip += sdiff(newInd, rc.indicate_seq);   // seqs skipped by the window shift
-        while (!rc.pending.empty()) {
-            auto it = rc.pending.begin();
-            if (sdiff(it->first, newInd) < 0) {      // below the new window — flush in order
-                emitReorderRtp(it->second.data(), it->second.size());
-                rc.pending.erase(it);
-            } else break;
+        // Flush strictly in order from indicate_seq up to newInd (wrap-safe walk): deliver any
+        // present, skip the truly-missing. begin()-based iteration was wrong across the wrap.
+        while (rc.indicate_seq != newInd) {
+            auto it = rc.pending.find(rc.indicate_seq);
+            if (it != rc.pending.end()) { emitReorderRtp(it->second.data(), it->second.size()); rc.pending.erase(it); }
+            rc.indicate_seq = (rc.indicate_seq + 1) & 0xfff;
         }
-        rc.indicate_seq = newInd;
         rc.lastFlushMs = now;
         drain();                                     // deliver consecutive from newInd
         d = sdiff(sq, rc.indicate_seq);              // recompute; now in-window
@@ -502,8 +620,9 @@ bool RxDeframe::processReorder(uint8_t tid, uint16_t seq, const uint8_t* llc, si
     // RELEASE TIMER: if a gap at indicate_seq persists past the timeout, skip the (lost) seq —
     // advance to the lowest buffered frame and drain. Prevents a permanent-loss stall/freeze.
     if (!rc.pending.empty() && (now - rc.lastFlushMs) > kReorderTimeoutMs) {
-        cToFlush++; cToSkip += sdiff(rc.pending.begin()->first, rc.indicate_seq);  // gap seqs skipped
-        rc.indicate_seq = rc.pending.begin()->first;
+        uint16_t lp = lowestPending();               // wrap-safe true-next buffered (not numeric-min)
+        cToFlush++; cToSkip += sdiff(lp, rc.indicate_seq);  // gap seqs skipped
+        rc.indicate_seq = lp;
         rc.lastFlushMs = now;
         drain();
     }
