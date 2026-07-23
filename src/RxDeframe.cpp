@@ -466,6 +466,18 @@ void RxDeframe::emitReorderRtp(const uint8_t* llc, size_t llcLen) {
 static int64_t reorderTimeoutMs() {
     static int64_t v = [] {
         if (const char* e = std::getenv("DEVOURER_REORDER_MS")) { int n = std::atoi(e); if (n > 0) return (int64_t)n; }
+#if defined(__ANDROID__)
+        // Live-tunable without a rebuild (adb shell setprop debug.pixelpilot.reorderms N). Added
+        // to test whether real compressed-BA-style retransmits under accept-BA (DEVOURER_ENABLE_BA
+        // / debug.pixelpilot.ba=1) need longer than the kernel's 50ms REORDER_WAIT_TIME to arrive —
+        // under real A-MPDU aggregation the AP has more airtime contention per retransmit cycle
+        // than the decline-BA/no-aggregation case this constant was originally tuned against.
+        char v2[PROP_VALUE_MAX] = {0};
+        if (__system_property_get("debug.pixelpilot.reorderms", v2) > 0) {
+            int n = std::atoi(v2);
+            if (n > 0) return (int64_t)n;
+        }
+#endif
         return (int64_t)50;   // kernel REORDER_WAIT_TIME (include/rtw_recv.h); bench 60≈50 best
     }();
     return v;

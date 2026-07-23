@@ -9,6 +9,7 @@
 #include <android/log.h>
 #endif
 #include <cstring>
+#include <cstdlib>
 #include <atomic>
 #include <thread>
 #include <mutex>
@@ -27,9 +28,32 @@
 #endif
 #if defined(__ANDROID__)
 #include <android/log.h>
+#include <sys/system_properties.h>
 #endif
 
 namespace apfpv {
+
+// LQ send interval override, live-tunable without a rebuild. Default (33ms/30Hz, matching
+// aalink's own RSSI_SAMPLE_INTERVAL_MS) sends 2 packets/cycle through the SAME shared dongle
+// TX path (sendIpPacket -> sendStationFrameSync -> a real synchronous USBDEVFS_BULK ioctl) that
+// video RX competes with -- 60 TX calls/sec, continuously, for the whole streaming session,
+// independent of any other feature (SSH route, etc). aalink's OWN decision cadence is on the
+// order of SECONDS (UP_COOLDOWN_MS=2000 in aalink.conf), so 30Hz RSSI resolution is almost
+// certainly far finer than its control loop needs -- worth testing whether a slower cadence
+// reduces TX-path contention (and therefore RX hiccups at high throughput) without harming
+// aalink's actual bitrate adaptation. DEVOURER_LQ_MS (host) / debug.pixelpilot.lqms (Android);
+// 0/unset = unchanged default behavior.
+static int lqSendIntervalOverrideMs() {
+    if (const char* e = std::getenv("DEVOURER_LQ_MS")) { int n = std::atoi(e); if (n > 0) return n; }
+#if defined(__ANDROID__)
+    char v[PROP_VALUE_MAX] = {0};
+    if (__system_property_get("debug.pixelpilot.lqms", v) > 0) {
+        int n = std::atoi(v);
+        if (n > 0) return n;
+    }
+#endif
+    return 0;
+}
 
 // internal state (PImpl-lite via file-static per instance would be cleaner;
 // kept as members through a small struct mirrored from the header).
@@ -105,7 +129,11 @@ static void emit(double& sA, double& sB, bool& init) {
 
 static void loopFixed() {
     using namespace std::chrono; double sA=0,sB=0; bool init=false;
-    while (g.run) { emit(sA,sB,init); std::this_thread::sleep_for(milliseconds(g.cfg.send_interval_ms)); }
+    while (g.run) {
+        emit(sA,sB,init);
+        int ms = lqSendIntervalOverrideMs();
+        std::this_thread::sleep_for(milliseconds(ms > 0 ? ms : g.cfg.send_interval_ms));
+    }
 }
 static void loopFrameDriven() {
     using namespace std::chrono; double sA=0,sB=0; bool init=false;

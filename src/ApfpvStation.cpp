@@ -53,6 +53,20 @@ static bool apfpvProp(const char* name) {
 static bool enableBaOn() {
     return std::getenv("DEVOURER_ENABLE_BA") != nullptr || apfpvProp("debug.pixelpilot.ba");
 }
+// Buffer size (in MPDUs) to negotiate in OUR ADDBA Response, overriding the AP's request (see
+// handleAddbaRequest). 0/unset = echo the AP's requested value unchanged. DEVOURER_BA_BUFSZ (host)
+// / debug.pixelpilot.babufsz (Android).
+static int baRespBufSizeOverride() {
+    if (const char* e = std::getenv("DEVOURER_BA_BUFSZ")) { int n = std::atoi(e); if (n > 0) return n; }
+#if defined(__ANDROID__)
+    char v[PROP_VALUE_MAX] = {0};
+    if (__system_property_get("debug.pixelpilot.babufsz", v) > 0) {
+        int n = std::atoi(v);
+        if (n > 0) return n;
+    }
+#endif
+    return 0;
+}
 } // namespace
 // Platform-agnostic: <android/log.h> is the NDK header on Android and the
 // compat stderr shim on native host builds (see WiFiDriver/compat), so the same
@@ -1418,8 +1432,31 @@ void ApfpvStation::handleAddbaRequest(const uint8_t* frame, size_t len) {
     r.push_back(0x03); r.push_back(0x01); r.push_back(dialog);
     if (declineBa) { r.push_back(37); r.push_back(0x00); }      // StatusCode = 37 (REFUSED)
     else           { r.push_back(0x00); r.push_back(0x00); }    // StatusCode = 0 (success)
-    r.push_back(body[3]); r.push_back(body[4]);                 // BA Parameter Set (echo)
+    // BA Parameter Set: bit0=AMSDU-supported, bit1=policy, bits2-5=TID, bits6-15=buffer size
+    // (10 bits). We normally echo the AP's requested value verbatim (see the note above about
+    // NOT appending extra bytes — that's still true and unrelated to this). But since we can't
+    // emit a real compressed BlockAck, a lost sub-frame inside a 64-deep aggregate has no correct
+    // way to be identified/retransmitted, and it shows up as a chunk of missing bitstream data
+    // (visually: motion-compensated "tails" on moving objects that persist until a later frame
+    // overwrites them). The responder is allowed by spec to negotiate a SMALLER buffer size than
+    // requested; a smaller window means the AP bursts fewer MPDUs per aggregate, so any one loss
+    // event corrupts a smaller slice of a frame instead of up to 64 frames' worth. Opt-in via
+    // DEVOURER_BA_BUFSZ (host) / debug.pixelpilot.babufsz (Android) so it's A/B-testable without
+    // a rebuild per value; 0 or unset = echo the AP's request unchanged (today's behavior).
+    uint16_t reqParam   = (uint16_t)(body[3] | (body[4] << 8));
+    uint16_t reqBufsz   = (reqParam >> 6) & 0x3ff;
+    int      bufszOverride = baRespBufSizeOverride();
+    uint16_t sentBufsz  = reqBufsz;
+    if (bufszOverride > 0) {
+        uint16_t newParam = (uint16_t)((reqParam & 0x3f) | ((uint16_t)bufszOverride << 6));
+        r.push_back((uint8_t)(newParam & 0xff)); r.push_back((uint8_t)(newParam >> 8));
+        sentBufsz = (uint16_t)bufszOverride;
+    } else {
+        r.push_back(body[3]); r.push_back(body[4]);             // BA Parameter Set (echo)
+    }
     r.push_back(body[5]); r.push_back(body[6]);                 // BA Timeout (echo)
+    SCANLOG("ADDBA Response BUILD dialog=%u tid=%u status=%u reqBufsz=%u sentBufsz=%u (override=%d)",
+            dialog, tid, declineBa ? 37 : 0, reqBufsz, sentBufsz, bufszOverride);
 
     // Send the ADDBA Response DIRECTLY via send_packet. With the raw-fd
     // USBDEVFS_BULK TX path this is a synchronous kernel ioctl that the USB
