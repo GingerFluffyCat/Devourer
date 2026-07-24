@@ -115,7 +115,12 @@ int WfbngLink::run(JNIEnv *env, jobject context, jint wifiChannel, jint bw, jint
     r = libusb_claim_interface(dev_handle, 0);
     __android_log_print(ANDROID_LOG_DEBUG, TAG, "Creating driver and device for fd=%d", fd);
 
-    rtl_devices.emplace(fd, wifi_driver->CreateRtlDevice(dev_handle));
+    // Assign (not emplace): on a physical replug, Android frequently reissues the SAME fd
+    // integer. emplace() is a no-op if the key already exists, so it would silently keep
+    // the STALE device from the previous (now-torn-down) session -- bound to a closed libusb
+    // handle, with should_stop already true from that session's stop() -- instead of the fresh
+    // one just created above. That stale reuse is what left a reattach connected to nothing.
+    rtl_devices[fd] = wifi_driver->CreateRtlDevice(dev_handle);
     if (!rtl_devices.at(fd)) {
         libusb_exit(ctx);
         __android_log_print(ANDROID_LOG_ERROR, TAG, "CreateRtlDevice error");
@@ -261,6 +266,7 @@ int WfbngLink::run(JNIEnv *env, jobject context, jint wifiChannel, jint bw, jint
         destroy_thread(usb_tx_thread);
         destroy_thread(usb_event_thread);
         stop_adaptive_link();
+        rtl_devices.erase(fd);   // don't leave a dead entry a fd-reused reattach could hit
         return -1;
     }
 
@@ -278,6 +284,7 @@ int WfbngLink::run(JNIEnv *env, jobject context, jint wifiChannel, jint bw, jint
     r = libusb_release_interface(dev_handle, 0);
     __android_log_print(ANDROID_LOG_DEBUG, TAG, "libusb_release_interface: %d", r);
     libusb_exit(ctx);
+    rtl_devices.erase(fd);   // don't leave a dead entry a fd-reused reattach could hit
     return 0;
 }
 
