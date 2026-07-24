@@ -88,6 +88,12 @@ public:
   RtlJaguarDevice(RtlAdapter device, Logger_t logger,
                   devourer::DeviceConfig cfg = {});
   ~RtlJaguarDevice() override;
+  // APFPV additions -- direct access to the bus-neutral register adapter and the
+  // chip's radio manager, for callers (ApfpvStation, its JNI bridge) that need to
+  // drive them alongside IRtlDevice's chip-agnostic surface (station-mode arming,
+  // register-level RX-filter tuning). Jaguar1-specific, hence not part of IRtlDevice.
+  RtlAdapter& adapter() { return _device; }
+  RadioManagementModule& radioManager() { return *_radioManagement; }
   void Init(Action_ParsedRadioPacket packetProcessor,
             SelectedChannel channel) override;
   /* Blocking RX worker loop on an already-brought-up chip (see IRtlDevice).

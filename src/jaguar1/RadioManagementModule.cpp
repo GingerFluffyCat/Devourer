@@ -14,6 +14,9 @@ extern "C" {
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#if defined(__ANDROID__)
+#include <sys/system_properties.h>
+#endif
 
 namespace {
 

@@ -35,3 +35,6 @@
 	path = reference/rtl8852cu
 	url = https://github.com/josephnef/rtl8852cu.git
 	shallow = true
+[submodule "extern/WiFiDriver"]
+	path = extern/WiFiDriver
+	url = https://github.com/GingerFluffyCat/WiFiDriver.git
