@@ -91,52 +91,63 @@ LqFeedback::LqFeedback() { g.cfg = Config{}; }
 LqFeedback::LqFeedback(Config cfg) { g.cfg = cfg; }
 void LqFeedback::setSink(std::function<void(const char*, int)> fn) { g.sink = std::move(fn); }
 
-static void emit(double& sA, double& sB, bool& init) {
+// Smoothing matched to aalink's OWN local (uplink) RSSI tracker (sickgreg/aalink.c: ema_fast/
+// ema_slow, alpha_fast=0.4, alpha_slow=0.1 -- see rssi_worker()). A single alpha=0.3 EMA here was
+// visibly jitterier than that reference: Windows' WlanQueryInterface RSSI reads fluctuate a few dB
+// per query, and rssiPct's steep 2%/dBm slope amplifies that into a visibly jumpy percentage. Send
+// the slow tracker -- aalink's own definition of a "stable baseline" -- so the downlink number we
+// hand aalink is exactly as calm as the local reading it already produces. (Deliberately not
+// replicating aalink's fast-vs-slow predictive-pessimism extrapolation on top of that: that's a
+// rate-control decision bias for the air side, not a jitter fix for what we report.)
+static constexpr double kAlphaFast = 0.4, kAlphaSlow = 0.1;
+
+static void emit(double& fastA, double& slowA, double& fastB, double& slowB, bool& init) {
     int a = g.a.load(), b = g.b.load();
-    double alpha = g.cfg.smoothing_alpha;
-    if (!init) { sA = a; sB = b; init = true; }
-    else { sA = alpha*a + (1-alpha)*sA; sB = alpha*b + (1-alpha)*sB; }
-    char buf[64]; int n;
-    // aalink parses: "%*[^=]=%*s rssi_a = %d(%%), rssi_b = %d(%%)" — i.e. it
-    // skips a leading "token=word " prefix, THEN reads the rssi fields. Without
-    // the prefix the sscanf fails and the ground RSSI is ignored. Match the
-    // firmware exactly (confirmed against the greg10.2 aalink binary).
-    int pctA = LqFeedback::rssiPct((int)sA), pctB = LqFeedback::rssiPct((int)sB);
-    if (g.haveB)
-        n = std::snprintf(buf, sizeof(buf), "gs_string=gs rssi_a = %d(%%), rssi_b = %d(%%)\n", pctA, pctB);
-    else
-        n = std::snprintf(buf, sizeof(buf), "gs_string=gs rssi_a = %d(%%)\n", pctA);
+    if (!init) { fastA = slowA = a; fastB = slowB = b; init = true; }
+    else {
+        fastA = kAlphaFast * a + (1 - kAlphaFast) * fastA;
+        slowA = kAlphaSlow * a + (1 - kAlphaSlow) * slowA;
+        fastB = kAlphaFast * b + (1 - kAlphaFast) * fastB;
+        slowB = kAlphaSlow * b + (1 - kAlphaSlow) * slowB;
+    }
+    int pctA = LqFeedback::rssiPct((int)slowA), pctB = LqFeedback::rssiPct((int)slowB);
+    // aalink's real UDP wire protocol (confirmed against sickgreg/aalink.c's recvfrom handler):
+    // it splits on the FIRST comma, atoi()s everything before it as the 0-100 percentage, and
+    // treats everything after as an optional OSD label. The previously-sent verbose
+    // "gs_string=gs rssi_a = %d(%%), rssi_b = %d(%%)" form is NOT this protocol -- that exact
+    // format string only appears in aalink.c as a LOCAL proc-file parser (its own driver's
+    // rssi_a/rssi_b sysfs hooks), not the network format. Sent over UDP, its embedded comma
+    // (between the rssi_a and rssi_b clauses) is the first one aalink's parser finds, so it
+    // splits there and atoi()s the leading "gs_string=gs rssi_a = %d(%%)" text -- which doesn't
+    // start with a digit, so atoi() returns 0. aalink accepts 0 as a valid (terrible) reading
+    // and immediately steps MCS down (no cooldown on step-down), every single cycle this was
+    // sent -- fighting the correctly-parsed bare value's slow, confidence-gated step-up and
+    // pinning MCS near 0 whenever any feedback was flowing. Send ONLY the correct format.
+    char buf[32];
+    int n = std::snprintf(buf, sizeof(buf), "%d,gs", pctA);
     if (n > 0) {
         if (g.sink) g.sink(buf, n);
         else if (g.sock >= 0) ::sendto(g.sock, buf, (size_t)n, 0, (sockaddr*)&g.dst, sizeof(g.dst));
-    }
-    // Also send the BARE percentage that the phone-Wi-Fi path uses (ApfpvWifiManager sends
-    // Integer.toString(pct)) — that variant is confirmed to move the VTX downlink %, whereas the
-    // verbose "gs_string=" form above may not parse on the current aalink. Belt-and-suspenders.
-    char bare[16]; int bn = std::snprintf(bare, sizeof(bare), "%d", pctA);
-    if (bn > 0) {
-        if (g.sink) g.sink(bare, bn);
-        else if (g.sock >= 0) ::sendto(g.sock, bare, (size_t)bn, 0, (sockaddr*)&g.dst, sizeof(g.dst));
     }
 #if defined(__ANDROID__)
     // DIAGNOSTIC: surface the RSSI→pct we are actually sending (rules out a 0-value RSSI conversion).
     static int dbgN = 0;
     if ((dbgN++ % 30) == 0)
         __android_log_print(4, "apfpv-lq", "LQ send rssiA=%.0f pctA=%d (haveB=%d pctB=%d)",
-                            sA, pctA, (int)g.haveB, pctB);
+                            slowA, pctA, (int)g.haveB, pctB);
 #endif
 }
 
 static void loopFixed() {
-    using namespace std::chrono; double sA=0,sB=0; bool init=false;
+    using namespace std::chrono; double fastA=0,slowA=0,fastB=0,slowB=0; bool init=false;
     while (g.run) {
-        emit(sA,sB,init);
+        emit(fastA,slowA,fastB,slowB,init);
         int ms = lqSendIntervalOverrideMs();
         std::this_thread::sleep_for(milliseconds(ms > 0 ? ms : g.cfg.send_interval_ms));
     }
 }
 static void loopFrameDriven() {
-    using namespace std::chrono; double sA=0,sB=0; bool init=false;
+    using namespace std::chrono; double fastA=0,slowA=0,fastB=0,slowB=0; bool init=false;
     while (g.run) {
         std::unique_lock<std::mutex> lk(g.m);
         auto wait = g.cfg.keepalive_ms > 0 ? milliseconds(g.cfg.keepalive_ms) : milliseconds(1000);
@@ -144,7 +155,7 @@ static void loopFrameDriven() {
         bool wasFresh = g.fresh; g.fresh = false; lk.unlock();
         if (!g.run) break;
         if (wasFresh || g.cfg.keepalive_ms > 0) {
-            emit(sA,sB,init);
+            emit(fastA,slowA,fastB,slowB,init);
             std::this_thread::sleep_for(milliseconds(g.cfg.min_interval_ms));
         }
     }
