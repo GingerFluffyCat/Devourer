@@ -511,7 +511,20 @@ static int64_t reorderTimeoutMs() {
             if (n > 0) return (int64_t)n;
         }
 #endif
-        return (int64_t)50;   // kernel REORDER_WAIT_TIME (include/rtw_recv.h); bench 60≈50 best
+        // 12ms, NOT the kernel's 50ms REORDER_WAIT_TIME. The kernel constant is tuned for a
+        // driver that CAN emit compressed BlockAck, so a held gap is genuinely likely to be
+        // filled by a retransmit and waiting 50ms pays off. We DECLINE BA by default (this
+        // dongle can't emit compressed BA from userspace), so almost nothing is ever retransmitted
+        // and the hold is mostly dead time. Measured on-device (OnePlus CPH2651 + RTL8812AU vs a
+        // live OpenIPC AP, 1080p H265 @90fps, 40MHz): out-of-order is 0.015-0.023% of RX frames
+        // (28 of 181200), so the 50ms hold almost never recovers anything -- yet it stalled RTP
+        // delivery up to 50ms on each of 72 gap events. Dropping to 12ms measured: parse
+        // 8.18->5.70ms, decode-path sum 15.15->12.70ms, decFail 3.09->2.21%, lost 0.040->0.026%,
+        // renderFps unchanged ~90, with ooo rising only 0.015->0.023% (the expected, negligible
+        // cost of the shorter hold). Raise it via DEVOURER_REORDER_MS / debug.pixelpilot.reorderms
+        // if you enable accept-BA (debug.pixelpilot.ba=1), where real retransmits DO arrive and
+        // need the longer window.
+        return (int64_t)12;
     }();
     return v;
 }

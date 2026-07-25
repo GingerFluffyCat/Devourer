@@ -33,16 +33,13 @@
 
 namespace apfpv {
 
-// LQ send interval override, live-tunable without a rebuild. Default (33ms/30Hz, matching
-// aalink's own RSSI_SAMPLE_INTERVAL_MS) sends 2 packets/cycle through the SAME shared dongle
-// TX path (sendIpPacket -> sendStationFrameSync -> a real synchronous USBDEVFS_BULK ioctl) that
-// video RX competes with -- 60 TX calls/sec, continuously, for the whole streaming session,
-// independent of any other feature (SSH route, etc). aalink's OWN decision cadence is on the
-// order of SECONDS (UP_COOLDOWN_MS=2000 in aalink.conf), so 30Hz RSSI resolution is almost
-// certainly far finer than its control loop needs -- worth testing whether a slower cadence
-// reduces TX-path contention (and therefore RX hiccups at high throughput) without harming
-// aalink's actual bitrate adaptation. DEVOURER_LQ_MS (host) / debug.pixelpilot.lqms (Android);
-// 0/unset = unchanged default behavior.
+// LQ send interval override, live-tunable without a rebuild. Each cycle emits ONE datagram
+// through the SAME shared dongle TX path (sendIpPacket -> sendStationFrameSync -> a real
+// synchronous USBDEVFS_BULK ioctl) that video RX competes with, continuously for the whole
+// streaming session. That contention is why the default is 250 ms (see LqFeedback.h for the
+// rationale and the on-device measurements) rather than aalink's own 33 ms sampling rate.
+// DEVOURER_LQ_MS (host) / debug.pixelpilot.lqms (Android); 0/unset = use Config default.
+// Keep any override <=500 ms: aalink falls back to proc-RSSI after UDP_TIMEOUT_LOOPS=10 (~1 s).
 static int lqSendIntervalOverrideMs() {
     if (const char* e = std::getenv("DEVOURER_LQ_MS")) { int n = std::atoi(e); if (n > 0) return n; }
 #if defined(__ANDROID__)
