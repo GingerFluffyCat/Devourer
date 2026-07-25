@@ -936,7 +936,27 @@ bool ApfpvStation::runConnectChain() {
         // goes on-air (verified via VTX hostapd: assoc seen, M2 never received).
         apfpv::FillStationTxDesc(frame.data(), (uint16_t)mpdu.size(), 40,
                                  /*macid*/1, apfpv::StationFrameKind::Mgmt, /*raid*/7, /*rate*/0x04);
-        return dev.sendStationFrameSync(frame.data(), frame.size());
+        // M2/M4 fire from INSIDE the RX dispatch callback (EAPOL frames are handled
+        // synchronously as part of packet reception, unlike auth/assoc which come from the
+        // separate connect thread) -- so any TX call made here is REENTRANT with the RX loop.
+        // dev.send_packet -> UsbTransport::tx_async unconditionally calls
+        // libusb_handle_events_timeout_completed(_ctx, ...) on WHATEVER thread calls it (to reap
+        // prior completions before submitting) -- fine from the connect thread, but calling it
+        // from the RX thread's OWN callback re-enters libusb's event-handling lock on the same
+        // thread that's already holding it while dispatching this very callback. That's a
+        // non-recursive-mutex self-deadlock: no timeout, no error, the call just never returns.
+        // Confirmed directly: added logging immediately before/after the send -- the "about to
+        // send" line always fires, the "send returned" line never does, and _wpa->ready() never
+        // flips true, so the 5s handshake timeout fires every time (state 5 -> 11 -> 14).
+        // Fix: hand the actual USB submission to a detached thread so the blocking libusb call
+        // happens OFF the RX thread's call stack. wpa_supplicant/Wpa2Supplicant only use the
+        // return value for logging (the state transition to WaitMsg3/Done happens unconditionally
+        // right after calling this), so returning optimistically without waiting for the real
+        // completion is safe here.
+        std::thread([&dev, frame = std::move(frame)]() mutable {
+            dev.send_packet(frame.data(), frame.size());
+        }).detach();
+        return true;
     };
     _wpa = std::make_unique<Wpa2Supplicant>(MakeWpa2Crypto(), wpaSend);
     _wpa->setPmf(_params.pmf);                     // 802.11w: M2 RSN caps must match the assoc-req
@@ -956,7 +976,17 @@ bool ApfpvStation::runConnectChain() {
         // this chip. macid=0 is special/reserved on Jaguar and drains the FIFO silently.
         apfpv::FillStationTxDesc(frame.data(), (uint16_t)mpdu.size(), 40,
                                  1, apfpv::StationFrameKind::CcmpData, 7, 0x04);
-        return sendFrame(frame);
+        // ApfpvDhcp::onBootpReply calls this SYNCHRONOUSLY (OFFER -> REQUEST) from the RX
+        // dispatch's setDhcpSink callback -- same RX-thread-reentrancy hazard as wpaSend's M2/M4
+        // (see that comment for the full libusb_handle_events_timeout_completed self-deadlock
+        // explanation). sendFrame() defaults to sendStationFrameSync, which hits it. The initial
+        // DISCOVER and retransmits (ApfpvDhcp::retransmit(), driven by runConnectChain's own
+        // polling loop below) are issued from the connect thread and are NOT reentrant, so they
+        // stay on sendFrame/sendStationFrameSync; only THIS reply-triggered send needs deferring.
+        std::thread([&dev, frame = std::move(frame)]() mutable {
+            dev.send_packet(frame.data(), frame.size());
+        }).detach();
+        return true;
     };
     _dhcp = std::make_unique<ApfpvDhcp>(self.b, dhcpSend);
 
@@ -1324,12 +1354,18 @@ bool ApfpvStation::runConnectChain() {
         };
         for (int k=0;k<3;++k) _gratArp();                 // announce now
         // Answer subsequent ARP requests for our IP (keeps the unicast video stream alive).
+        // Fires SYNCHRONOUSLY from the RX thread on every incoming ARP request -- same
+        // reentrancy hazard as wpaSend/dhcpSend (see wpaSend's comment): sendStationFrameSync
+        // eventually calls libusb_handle_events_timeout_completed on this thread, re-entering
+        // the event lock the RX thread's own dispatch is already inside. Deferred.
         _rx->setArp(ip, [&dev](const std::vector<uint8_t>& mpdu){
             std::vector<uint8_t> fr(40 + mpdu.size(), 0);
             std::memcpy(fr.data()+40, mpdu.data(), mpdu.size());
             apfpv::FillStationTxDesc(fr.data(), (uint16_t)mpdu.size(), 40,
                                      1, apfpv::StationFrameKind::CcmpData, 7, 0x04);
-            dev.sendStationFrameSync(fr.data(), fr.size());
+            std::thread([&dev, fr]() mutable {
+                dev.sendStationFrameSync(fr.data(), fr.size());
+            }).detach();
         });
     }
 
@@ -1465,13 +1501,15 @@ void ApfpvStation::handleAddbaRequest(const uint8_t* frame, size_t len) {
     SCANLOG("ADDBA Response BUILD dialog=%u tid=%u status=%u reqBufsz=%u sentBufsz=%u (override=%d)",
             dialog, tid, declineBa ? 37 : 0, reqBufsz, sentBufsz, bufszOverride);
 
-    // Send the ADDBA Response DIRECTLY via send_packet. With the raw-fd
-    // USBDEVFS_BULK TX path this is a synchronous kernel ioctl that the USB
-    // stack interleaves with the in-flight IN URBs — it does NOT block the
-    // libusb event loop or touch its async reap queue, so it is safe to call
-    // from the RX dispatch here. This answers the AP within ~ms (no pause hack)
-    // and also handles ADDBA Requests that arrive DURING streaming, not just
-    // the connect-time burst.
+    // This runs from the RX dispatch (handles ADDBA Requests arriving DURING streaming, not
+    // just the connect-time burst), so — like wpaSend's M2/M4 and dhcpSend's REQUEST — neither
+    // send_packet nor sendStationFrameSync below may be called directly on this thread: both
+    // eventually call UsbTransport::tx_async, which unconditionally calls
+    // libusb_handle_events_timeout_completed(_ctx, ...) to reap prior completions, and doing
+    // that from the RX thread's OWN callback re-enters libusb's event lock on the same thread
+    // that's already holding it (self-deadlock, no timeout, no error). The comment this replaced
+    // described a raw-fd USBDEVFS_BULK transport where that's genuinely safe, but Android uses
+    // UsbTransport.cpp (libusb-based), where it is not. Deferred to a detached thread instead.
     std::vector<uint8_t> txf(40 + r.size(), 0);
     memcpy(txf.data()+40, r.data(), r.size());
     FillStationTxDesc(txf.data(), (uint16_t)r.size(), 40,
@@ -1489,11 +1527,16 @@ void ApfpvStation::handleAddbaRequest(const uint8_t* frame, size_t len) {
     // and the 3x sync starves RX ~30ms/burst. So keep the cheap async send by DEFAULT;
     // DEVOURER_ADDBA_RELIABLE opts into the kernel-style reliable (3x sync) tid=0 path.
     if (tid == 0 && std::getenv("DEVOURER_ADDBA_RELIABLE")) {
-        for (int rep = 0; rep < 3; ++rep) dev.sendStationFrameSync(txf.data(), txf.size());
-        SCANLOG("ADDBA Response tid=0 (3x reliable sync)");
+        std::thread([&dev, txf]() {
+            for (int rep = 0; rep < 3; ++rep) dev.sendStationFrameSync(
+                const_cast<uint8_t*>(txf.data()), txf.size());
+        }).detach();
+        SCANLOG("ADDBA Response tid=0 (3x reliable sync, deferred)");
     } else {
-        dev.send_packet(txf.data(), txf.size());
-        SCANLOG("ADDBA Response tid=%u (async)", tid);
+        std::thread([&dev, txf]() mutable {
+            dev.send_packet(txf.data(), txf.size());
+        }).detach();
+        SCANLOG("ADDBA Response tid=%u (async, deferred)", tid);
     }
 }
 

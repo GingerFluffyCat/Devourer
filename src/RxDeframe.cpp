@@ -244,7 +244,28 @@ void RxDeframe::onPacket(const Packet& pkt) {
             llc = body + 8; llcLen = bodyLen - 16; // strip CCMP header + trailing MIC
             decryptOk++;
         } else {
-            if (!_wpa || !_wpa->ready()) return;
+            if (!_wpa || !_wpa->ready()) {
+                // DIAGNOSTIC (rate-limited): a Protected-bit frame arriving before the supplicant
+                // is ready is dropped here unconditionally. Confirmed harmless in practice — this
+                // fires on ordinary group/broadcast traffic (GTK-encrypted, e.g. ARP/video
+                // multicast) that naturally starts arriving right after association, before the
+                // pairwise handshake finishes; M1/M3 themselves are NOT Protected (that theory was
+                // checked and ruled out — the real cause of the "stuck after M1" symptom was a
+                // reentrancy deadlock in the M2/M4 TX path, see ApfpvStation.cpp's wpaSend).
+                // Left in as a canary in case a future AP/driver combo genuinely does mark a
+                // handshake message Protected.
+#if defined(__ANDROID__)
+                if (_wpa) {
+                    static thread_local uint32_t droppedWhileNotReady = 0;
+                    if ((++droppedWhileNotReady % 20) == 1)
+                        __android_log_print(ANDROID_LOG_WARN, "apfpv-scan",
+                            "[hs] protected frame dropped, supplicant NOT ready yet (possible undelivered M3): "
+                            "fc=0x%04x len=%zu a1=%02x:%02x:%02x:%02x:%02x:%02x count=%u",
+                            fc, len, f[4],f[5],f[6],f[7],f[8],f[9], droppedWhileNotReady);
+                }
+#endif
+                return;
+            }
             if (!_wpa->decryptData(f, len, plainBuf)) {
                 _dbgDecFail++;
 #if defined(__ANDROID__)
