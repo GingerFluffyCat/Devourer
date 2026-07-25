@@ -1339,7 +1339,15 @@ bool ApfpvStation::runConnectChain() {
         // ARP entry for us never goes STALE (else unicast RTP stalls). In the real setup the LQ
         // feedback to the VTX also keeps it fresh, but this works on any subnet.
         _gratArp = [this, &dev, selfMac, ip]() {
-            if (!_wpa || !_wpa->ready()) return;
+            // DIAGNOSTIC: the VTX cannot resolve us (ARP INCOMPLETE) so its video backs up in
+            // tx_queue and never arrives. This separates the two possibilities that guesswork could
+            // not: the keepalive never running, versus running but not radiating.
+            static uint32_t gaN = 0;
+            bool rdy = (_wpa && _wpa->ready());
+            if ((gaN % 4) == 0)
+                SCANLOG("gratARP #%u: wpaReady=%d", gaN, (int) rdy);
+            gaN++;
+            if (!rdy) return;
             uint8_t arp[28] = {0,1, 8,0, 6,4, 0,1};
             std::memcpy(arp+8, selfMac.data(), 6);
             arp[14]=(ip>>24)&255; arp[15]=(ip>>16)&255; arp[16]=(ip>>8)&255; arp[17]=ip&255;
@@ -1350,7 +1358,8 @@ bool ApfpvStation::runConnectChain() {
             std::memcpy(fr.data()+40, m.data(), m.size());
             apfpv::FillStationTxDesc(fr.data(), (uint16_t)m.size(), 40,
                                      1, apfpv::StationFrameKind::CcmpData, 7, 0x04);
-            dev.sendStationFrameSync(fr.data(), fr.size());
+            bool okSend = dev.sendStationFrameSync(fr.data(), fr.size());
+            if ((gaN % 4) == 1) SCANLOG("gratARP tx len=%zu sent=%d", fr.size(), (int) okSend);
         };
         for (int k=0;k<3;++k) _gratArp();                 // announce now
         // Answer subsequent ARP requests for our IP (keeps the unicast video stream alive).
