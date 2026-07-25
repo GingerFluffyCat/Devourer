@@ -221,40 +221,51 @@ std::vector<Packet> FrameParser::recvbuf2recvframe(std::span<uint8_t> ptr) {
 
       struct _phy_status_rpt_8812 driver_data = {};
       /* Only read the PHY-status report when the descriptor says one is
-       * present and it fits the remaining buffer. The kernel gates this
-       * on pattrib->physt (usb_ops_linux.c:179); drvinfo_sz >= the report
-       * size is the equivalent condition with the fields we carry —
-       * without it, frames with drvinfo_sz==0 had payload bytes decoded
-       * as RSSI/EVM/SNR, and a frame ending near the buffer tail
-       * over-read the transfer buffer. */
-      if (pattrib.drvinfo_sz >= sizeof(driver_data) &&
+       * present (pattrib.physt) AND it fits the remaining buffer.
+       * drvinfo_sz >= the report size only proves the RESERVED region is
+       * big enough to hold one -- it's a fixed size driven by RCR config,
+       * true on nearly every frame regardless of whether the chip actually
+       * refreshed it for THIS one. physt is the HW's own per-frame validity
+       * bit (rxdw0 bit 26, kernel gates on it identically: usb_ops_linux.c
+       * :179 passes NULL when physt==0). Under aggregation only the first
+       * subframe of a burst carries a fresh report (RxPacket.h's own doc
+       * comment already says as much) -- treating every subsequent one as
+       * valid fed stale/leftover gain_trsw bytes into RSSI, which on a busy
+       * infra-mode unicast link (constant aggregation) is most frames, not
+       * an occasional one. Jaguar2/Jaguar3's parsers already gate on this
+       * (parse_phy_sts_jgr2 etc.); Jaguar1 was the one outlier. Leaving
+       * RxAtrib.rssi at its zero-init default here (rather than reusing the
+       * last valid reading) is deliberate and matches that same precedent —
+       * the buffer-overread fix in the comment this replaces is preserved
+       * via the unchanged size checks below. */
+      if (pattrib.physt && pattrib.drvinfo_sz >= sizeof(driver_data) &&
           pbuf.size() >= RXDESC_SIZE + sizeof(driver_data)) {
         memcpy(static_cast<void *>(&driver_data), pbuf.data() + RXDESC_SIZE,
                sizeof(driver_data));
+        ret.back().RxAtrib.rssi[0] = driver_data.gain_trsw[0];
+        ret.back().RxAtrib.rssi[1] = driver_data.gain_trsw[1];
+        /* 8814AU path C/D RSSI lives in gain_trsw_cd; on 8812/8811 these
+         * bytes are 0. */
+        ret.back().RxAtrib.rssi[2] = driver_data.gain_trsw_cd[0];
+        ret.back().RxAtrib.rssi[3] = driver_data.gain_trsw_cd[1];
+        ret.back().RxAtrib.snr[0] = driver_data.rxsnr[0];
+        ret.back().RxAtrib.snr[1] = driver_data.rxsnr[1];
+        /* 8814AU path C/D SNR is in csi_current per upstream's struct
+         * comment (DWORD 5 byte 1-2); on 8812 those bytes hold stream 1/2
+         * CSI which we don't surface, so the value is meaningful only when
+         * the chip is 8814AU. */
+        ret.back().RxAtrib.snr[2] = static_cast<int8_t>(driver_data.csi_current[0]);
+        ret.back().RxAtrib.snr[3] = static_cast<int8_t>(driver_data.csi_current[1]);
+        /* Per-stream RX EVM: streams 1/2 in rxevm, 3/4 in rxevm_cd (8814
+         * only; 0 on 8812/8811). Link-quality only — see rx_pkt_attrib::evm. */
+        ret.back().RxAtrib.evm[0] = driver_data.rxevm[0];
+        ret.back().RxAtrib.evm[1] = driver_data.rxevm[1];
+        ret.back().RxAtrib.evm[2] = driver_data.rxevm_cd[0];
+        ret.back().RxAtrib.evm[3] = driver_data.rxevm_cd[1];
+        /* Path-A CFO tail — the closed-loop CFO tracker input (#217). 8812
+         * 11AC phy-status carries it as a named field (DW2 byte1). */
+        ret.back().RxAtrib.cfo_tail = driver_data.cfotail[0];
       }
-      ret.back().RxAtrib.rssi[0] = driver_data.gain_trsw[0];
-      ret.back().RxAtrib.rssi[1] = driver_data.gain_trsw[1];
-      /* 8814AU path C/D RSSI lives in gain_trsw_cd; on 8812/8811 these bytes
-       * are 0. */
-      ret.back().RxAtrib.rssi[2] = driver_data.gain_trsw_cd[0];
-      ret.back().RxAtrib.rssi[3] = driver_data.gain_trsw_cd[1];
-      ret.back().RxAtrib.snr[0] = driver_data.rxsnr[0];
-      ret.back().RxAtrib.snr[1] = driver_data.rxsnr[1];
-      /* 8814AU path C/D SNR is in csi_current per upstream's struct comment
-       * (DWORD 5 byte 1-2); on 8812 those bytes hold stream 1/2 CSI which we
-       * don't surface, so the value is meaningful only when the chip is
-       * 8814AU. */
-      ret.back().RxAtrib.snr[2] = static_cast<int8_t>(driver_data.csi_current[0]);
-      ret.back().RxAtrib.snr[3] = static_cast<int8_t>(driver_data.csi_current[1]);
-      /* Per-stream RX EVM: streams 1/2 in rxevm, 3/4 in rxevm_cd (8814 only;
-       * 0 on 8812/8811). Link-quality only — see rx_pkt_attrib::evm. */
-      ret.back().RxAtrib.evm[0] = driver_data.rxevm[0];
-      ret.back().RxAtrib.evm[1] = driver_data.rxevm[1];
-      ret.back().RxAtrib.evm[2] = driver_data.rxevm_cd[0];
-      ret.back().RxAtrib.evm[3] = driver_data.rxevm_cd[1];
-      /* Path-A CFO tail — the closed-loop CFO tracker input (#217). 8812
-       * 11AC phy-status carries it as a named field (DW2 byte1). */
-      ret.back().RxAtrib.cfo_tail = driver_data.cfotail[0];
     } else {
       /* pkt_rpt_type == TX_REPORT1-CCX, TX_REPORT2-TX RTP,HIS_REPORT-USB HISR
        * RTP, C2H_PACKET */

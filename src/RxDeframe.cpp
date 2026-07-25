@@ -83,11 +83,23 @@ void RxDeframe::onPacket(const Packet& pkt) {
             __android_log_print(ANDROID_LOG_WARN, "rx-gap", "#%d RX gap %ldms (>12ms = RX blind this long)", ++gapN, gapMs);
     }
     if (_station) _station->notifyRxAlive();   // any RX = link alive (supervisor)
-    if (_lq) _lq->update(toDbm(pkt.RxAtrib.rssi[0]), toDbm(pkt.RxAtrib.rssi[1]));
-    // Feed live RX RSSI to DIG so it uses phydm *connected-mode* boundaries
-    // (IGI floor tracks RSSI ~0x37 @ -45 dBm) instead of monitor coverage
-    // bounds (capped 0x2a → over-gained → FA storm → AP rate-caps us).
-    PhydmWatchdog::SetLinkRssi(toDbm(pkt.RxAtrib.rssi[0]));
+    // RxAtrib.rssi[]/physt: FrameParser only populates rssi from a fresh
+    // gain_trsw read when the chip's own per-frame validity bit (physt) is
+    // set -- under aggregation only the burst's first subframe carries one,
+    // so most frames on a busy link leave rssi at its zero-init default.
+    // toDbm(0) reads as -100 dBm (clamped floor), so skip both consumers
+    // entirely on a physt-invalid frame instead of feeding that in as a
+    // real reading -- LqFeedback's own smoothing (LqFeedback.cpp's alpha-
+    // blend) holds the last real percentage between valid frames instead of
+    // getting dragged toward 0% by a false near-floor sample every burst,
+    // and the DIG floor below stays anchored to the last real RSSI too.
+    if (pkt.RxAtrib.physt) {
+        if (_lq) _lq->update(toDbm(pkt.RxAtrib.rssi[0]), toDbm(pkt.RxAtrib.rssi[1]));
+        // Feed live RX RSSI to DIG so it uses phydm *connected-mode* boundaries
+        // (IGI floor tracks RSSI ~0x37 @ -45 dBm) instead of monitor coverage
+        // bounds (capped 0x2a → over-gained → FA storm → AP rate-caps us).
+        PhydmWatchdog::SetLinkRssi(toDbm(pkt.RxAtrib.rssi[0]));
+    }
 
     const uint8_t* f = pkt.Data.data();
     size_t len = pkt.Data.size();
