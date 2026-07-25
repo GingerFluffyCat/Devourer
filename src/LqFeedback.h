@@ -11,7 +11,7 @@ public:
     // OpenIPC/adaptive-link *alink* (port 9999, colon score 1000-2000, ~1-5 Hz) — different protocol,
     // don't conflate the two. Keep 33 ms to match greg10.2 (the dongle did 130 fps at this rate).
     struct Config { Mode mode = Mode::FixedTimer; int send_interval_ms = 33;
-        int min_interval_ms = 20; int keepalive_ms = 0; double smoothing_alpha = 0.3; };
+        int min_interval_ms = 20; int keepalive_ms = 0; };
     static int rssiPct(int dbm);
     LqFeedback() ; explicit LqFeedback(Config cfg);
     ~LqFeedback() { stop(); }   // join thread + close socket on destroy (reconnect-safe)
