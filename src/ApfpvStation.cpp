@@ -681,7 +681,11 @@ bool ApfpvStation::runConnectChain() {
                 // -> watchdog -> reconnect loop. RxDeframe doesn't touch `sp`, so it's safe.
                 // NOTE: NO per-packet fprintf here — at 65Mbps that's 5600 blocking writes/s on
                 // the RX dispatch thread, which stalls RX and shreds frame assembly.
-                RxDeframe* rx = _rx.get(); if (rx) rx->onPacket(pkt); return;
+                // DECOUPLED: copy the frame into the bounded queue and return immediately, so SW
+                // CCMP decrypt + deframe (which now also carries MSP/aalink under msposd forwarding)
+                // runs on the consumer thread, NOT this USB read thread. Keeps the read loop fast so
+                // the URB ring never drains -> no link backpressure -> no VTX freeze. See RxQItem.
+                enqueueRxFrame(pkt); return;
             }
             // DISCOVERY/ARM path below calls into `sp` (the StationMode). Guard it: if `sta`
             // was destroyed, sp is dangling — TOCTOU-safe via the shared `alive` flag.
@@ -993,6 +997,7 @@ bool ApfpvStation::runConnectChain() {
     // Switch the ALREADY-RUNNING RX thread to the streaming path — do NOT re-Init
     // (that blocks). EAPOL (handshake), DHCP replies, and RTP now route through
     // RxDeframe via the dispatch. The device is already tuned to the AP's channel.
+    startRxConsumer();      // decouple decrypt/deframe from the USB read thread before streaming
     _rxPhase.store(1);
     {
         uint32_t r = dev.rtw_read32(0x0608);
@@ -1673,8 +1678,53 @@ void ApfpvStation::supervisorLoop() {
     }
 }
 
+// ---- streaming RX decouple: consumer thread + bounded queue (MSP-freeze fix) -------------
+void ApfpvStation::enqueueRxFrame(const Packet& pkt) {
+    // Copy the frame off the USB buffer (pkt.Data is a span the read path will recycle) and hand
+    // it to the consumer. Bounded + drop-OLDEST: if decrypt falls behind (heavy MSP + video), we
+    // discard the stalest frame rather than grow unbounded or block the read thread. RTP reorder
+    // downstream tolerates a drop; a link freeze does not.
+    const uint8_t* d = pkt.Data.data(); size_t n = pkt.Data.size();
+    if (!d || n == 0 || n > 8192) return;
+    {
+        std::lock_guard<std::mutex> lk(_rxQMu);
+        if (_rxQ.size() >= kRxQMax) _rxQ.pop_front();     // drop oldest
+        RxQItem it; it.atrib = pkt.RxAtrib; it.data.assign(d, d + n);
+        _rxQ.push_back(std::move(it));
+    }
+    _rxQCv.notify_one();
+}
+
+void ApfpvStation::startRxConsumer() {
+    if (_rxConsumerRun.exchange(true)) return;            // already running
+    _rxConsumer = std::thread([this]() {
+        for (;;) {
+            RxQItem it;
+            {
+                std::unique_lock<std::mutex> lk(_rxQMu);
+                _rxQCv.wait(lk, [this]{ return !_rxQ.empty() || !_rxConsumerRun.load(); });
+                if (!_rxConsumerRun.load() && _rxQ.empty()) return;
+                it = std::move(_rxQ.front()); _rxQ.pop_front();
+            }
+            // Rebuild a Packet pointing at our owned buffer; RxDeframe does the decrypt + dispatch.
+            Packet pkt; pkt.RxAtrib = it.atrib;
+            pkt.Data = std::span<uint8_t>(it.data.data(), it.data.size());
+            RxDeframe* rx = _rx.get();
+            if (rx) { try { rx->onPacket(pkt); } catch (...) {} }
+        }
+    });
+}
+
+void ApfpvStation::stopRxConsumer() {
+    if (!_rxConsumerRun.exchange(false)) return;
+    _rxQCv.notify_all();
+    if (_rxConsumer.joinable()) _rxConsumer.join();
+    std::lock_guard<std::mutex> lk(_rxQMu); _rxQ.clear();
+}
+
 void ApfpvStation::disconnect() {
     _run.store(false);
+    stopRxConsumer();               // stop the streaming-RX consumer thread + drain its queue
     PhydmWatchdog::SetUnlinked();   // restore monitor-mode DIG bounds (wfb-ng coexistence)
     // Join-safe: NEVER join the current thread (-> EINVAL "Invalid argument" -> uncaught
     // std::system_error -> SIGABRT, seen on replug when the JNI re-init teardown disconnect

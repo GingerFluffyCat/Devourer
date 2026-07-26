@@ -9,6 +9,9 @@
 #include <chrono>
 #include <mutex>
 #include <vector>
+#include "FrameParser.h"
+#include <deque>
+#include <condition_variable>
 #include <set>
 #include "ScanProbe.h"
 namespace apfpv {
@@ -171,6 +174,27 @@ private:
     std::thread _rxThread;
     std::atomic<int>  _rxPhase{0};
     std::atomic<bool> _rxReady{false};
+
+    // --- streaming RX decouple (the "MSP-forwarding freezes video" fix) --------------------
+    // The USB read loop (rtl->Init) used to call RxDeframe::onPacket INLINE, so SW CCMP decrypt
+    // + deframe ran on the read thread. Once msposd forwards MSP/DisplayPort to us, that extra
+    // per-frame decrypt time on the read thread delayed the next bulk read -> the URB ring drained
+    // -> link backpressure -> the AP's queue and majestic's RTP socket filled -> VTX stuck + black.
+    // Windows is immune only because its kernel driver decrypts off the single userspace thread.
+    // Fix: the read thread now COPIES each streaming frame into this bounded queue and returns
+    // immediately; a consumer thread does decrypt+onPacket. The read thread never stalls, so the
+    // ring stays armed and the link never backpressures — MSP load becomes bounded host-side queue
+    // delay instead of a link freeze. Bounded + drop-oldest: newest video is the useful video.
+    struct RxQItem { rx_pkt_attrib atrib; std::vector<uint8_t> data; };
+    std::deque<RxQItem>     _rxQ;
+    std::mutex              _rxQMu;
+    std::condition_variable _rxQCv;
+    std::thread             _rxConsumer;
+    std::atomic<bool>       _rxConsumerRun{false};
+    static constexpr size_t kRxQMax = 512;   // ~ a few ms of video at line rate; overflow drops oldest
+    void startRxConsumer();
+    void stopRxConsumer();
+    void enqueueRxFrame(const struct Packet& pkt);
     // scanAll() state — the RX collector runs on the device thread, so access is
     // mutex-guarded and _onScanAp is cleared before scanAll returns so the still-
     // running RX thread can never call into a destroyed callback.
