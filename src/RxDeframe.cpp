@@ -83,7 +83,19 @@ void RxDeframe::onPacket(const Packet& pkt) {
             __android_log_print(ANDROID_LOG_WARN, "rx-gap", "#%d RX gap %ldms (>12ms = RX blind this long)", ++gapN, gapMs);
     }
     if (_station) _station->notifyRxAlive();   // any RX = link alive (supervisor)
-    if (_lq) _lq->update(toDbm(pkt.RxAtrib.rssi[0]), toDbm(pkt.RxAtrib.rssi[1]));
+    if (_lq) {
+        // aalink with MCS_SOURCE=lowest picks the WORST of rssi_a/rssi_b. On a single-stream
+        // downlink (the VTX transmits 1 spatial stream) the unused RX chain reads a floor gain
+        // (rssi[1] ~ gain 0 -> toDbm -100 -> rssiPct 0%), which drags "lowest" to MCS 0 and the
+        // air caps us at ~100 kbps. Windows' lqfeedback_cli avoids this by reporting ONE
+        // representative RSSI as BOTH fields (feedback.update(rssi, rssi)). Do the same here:
+        // take the stronger chain and send it on both rssi_a and rssi_b, so a dead/floored RX
+        // chain never floors the LQ the VTX adapts against.
+        int dA = toDbm(pkt.RxAtrib.rssi[0]);
+        int dB = toDbm(pkt.RxAtrib.rssi[1]);
+        int best = dA > dB ? dA : dB;
+        _lq->update(best, best);
+    }
     // Feed live RX RSSI to DIG so it uses phydm *connected-mode* boundaries
     // (IGI floor tracks RSSI ~0x37 @ -45 dBm) instead of monitor coverage
     // bounds (capped 0x2a → over-gained → FA storm → AP rate-caps us).

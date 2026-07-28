@@ -97,26 +97,23 @@ static void emit(double& sA, double& sB, bool& init) {
     if (!init) { sA = a; sB = b; init = true; }
     else { sA = alpha*a + (1-alpha)*sA; sB = alpha*b + (1-alpha)*sB; }
     char buf[64]; int n;
-    // aalink parses: "%*[^=]=%*s rssi_a = %d(%%), rssi_b = %d(%%)" — i.e. it
-    // skips a leading "token=word " prefix, THEN reads the rssi fields. Without
-    // the prefix the sscanf fails and the ground RSSI is ignored. Match the
-    // firmware exactly (confirmed against the greg10.2 aalink binary).
+    // aalink's UDP RSSI parser expects a BARE PERCENTAGE WITH the '%' sign ("NN%",
+    // its " %d%% (nl80211 raw)" form). VERIFIED live on the greg10.2 VTX (reading
+    // /tmp/aalink_ext.msg while injecting): "90%" -> rssi_udp≈95 -> used_rssi =
+    // min(rssi_local, rssi_udp) -> MCS ramps (mcs3 / 16.9 Mbps at rssi_local=54).
+    //
+    // Two forms we USED to send both FAILED and one actively POISONED the link:
+    //   * "gs_string=gs rssi_a = NN(%), rssi_b = NN(%)" is aalink's LOCAL driver-hook
+    //     format ("%*[^=]=%*s rssi_a = %d(%%)..."), NOT the UDP format. Sending it
+    //     over UDP made aalink flip used_source to "lowest" but parse rssi_udp=0 ->
+    //     min()=0 -> MCS0 -> ~100 kbps. This was the phone's 100 kbps bug.
+    //   * the bare "%d" WITHOUT the '%' was ignored entirely (rssi_udp stayed -1).
+    // So send ONLY the "%d%%" form. pctB is kept for the diagnostic log below.
     int pctA = LqFeedback::rssiPct((int)sA), pctB = LqFeedback::rssiPct((int)sB);
-    if (g.haveB)
-        n = std::snprintf(buf, sizeof(buf), "gs_string=gs rssi_a = %d(%%), rssi_b = %d(%%)\n", pctA, pctB);
-    else
-        n = std::snprintf(buf, sizeof(buf), "gs_string=gs rssi_a = %d(%%)\n", pctA);
+    n = std::snprintf(buf, sizeof(buf), "%d%%", pctA);
     if (n > 0) {
         if (g.sink) g.sink(buf, n);
         else if (g.sock >= 0) ::sendto(g.sock, buf, (size_t)n, 0, (sockaddr*)&g.dst, sizeof(g.dst));
-    }
-    // Also send the BARE percentage that the phone-Wi-Fi path uses (ApfpvWifiManager sends
-    // Integer.toString(pct)) — that variant is confirmed to move the VTX downlink %, whereas the
-    // verbose "gs_string=" form above may not parse on the current aalink. Belt-and-suspenders.
-    char bare[16]; int bn = std::snprintf(bare, sizeof(bare), "%d", pctA);
-    if (bn > 0) {
-        if (g.sink) g.sink(bare, bn);
-        else if (g.sock >= 0) ::sendto(g.sock, bare, (size_t)bn, 0, (sockaddr*)&g.dst, sizeof(g.dst));
     }
 #if defined(__ANDROID__)
     // DIAGNOSTIC: surface the RSSI→pct we are actually sending (rules out a 0-value RSSI conversion).
