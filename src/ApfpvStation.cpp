@@ -1017,12 +1017,27 @@ bool ApfpvStation::runConnectChain() {
         }
     }
 
-    // Bandwidth already set correctly by the arm (sta.setConnectWidth matches the
-    // AP's negotiated width). Running pauseAsyncRx/resumeAsyncRx here — even when
-    // set_channel_bwmode is a no-op — disrupts RX exactly when data starts flowing,
-    // causing the "black screen + inactivity timeout" pattern. The pause/resume was
-    // historically needed for IQK control-I/O isolation; IQK is now disabled by
-    // default, so there is no reason to touch the RX pipeline here.
+    // APPLY THE ADOPTED WIDTH NOW. The arm ran at the width known BEFORE the connect
+    // (setConnectWidth from _params.bandwidth). On the first connect that's 20 MHz — we only
+    // learn the AP's real width from the assoc-response DURING the arm (it updates
+    // _params.bandwidth). So without this the radio streams at 20 MHz while a 40/80 AP transmits
+    // wide -> RX blind ~100ms at a time (rx-gap storm), the observed "40/80 doesn't work".
+    // Re-tune to the adopted width at the SAME channel: no band change -> no fresh IQK -> no synth
+    // wedge (IQK is disabled anyway). A BARE set_channel_bwmode (no pause/resume) is safe here —
+    // it's the pause/resume, not the tune, that historically disrupted RX. Center/offset come from
+    // the same correct path the arm uses (prime_offset_40mhz -> center 38/46, or 80MHz -> 42).
+    {
+        ChannelWidth_t adoptBw = _params.bandwidth >= 80 ? CHANNEL_WIDTH_80
+                               : _params.bandwidth >= 40 ? CHANNEL_WIDTH_40 : CHANNEL_WIDTH_20;
+        if (std::getenv("DEVOURER_FORCE_20MHZ")) adoptBw = CHANNEL_WIDTH_20;
+        if (adoptBw != CHANNEL_WIDTH_20) {
+            uint8_t off40 = (adoptBw == CHANNEL_WIDTH_40)
+                                ? rm.prime_offset_40mhz((uint8_t)_params.channel) : 0;
+            rm.set_channel_bwmode((uint8_t)_params.channel, off40, adoptBw);
+            SCANLOG("post-handshake width: ch%d -> %dMHz (off=%d) — match AP's operating width",
+                    (int)_params.channel, adoptBw == CHANNEL_WIDTH_80 ? 80 : 40, (int)off40);
+        }
+    }
 
     // Enable fire-and-forget TX NOW (before LQ/DHCP start). The per-TX TXPKT_EMPTY
     // drain in sendStationFrameSync blocks the USB bus for ~100ms each call, and LQ
