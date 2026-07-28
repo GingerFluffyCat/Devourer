@@ -97,20 +97,24 @@ static void emit(double& sA, double& sB, bool& init) {
     if (!init) { sA = a; sB = b; init = true; }
     else { sA = alpha*a + (1-alpha)*sA; sB = alpha*b + (1-alpha)*sB; }
     char buf[64]; int n;
-    // aalink's UDP RSSI parser expects a BARE PERCENTAGE WITH the '%' sign ("NN%",
-    // its " %d%% (nl80211 raw)" form). VERIFIED live on the greg10.2 VTX (reading
-    // /tmp/aalink_ext.msg while injecting): "90%" -> rssi_udp≈95 -> used_rssi =
-    // min(rssi_local, rssi_udp) -> MCS ramps (mcs3 / 16.9 Mbps at rssi_local=54).
+    // aalink's real UDP wire protocol (confirmed against sickgreg/aalink.c's recvfrom
+    // handler, and matching the Windows GS lqfeedback_cli which is proven to drive the
+    // link): "<pct>,<label>" — aalink atoi()s everything BEFORE the first comma as the
+    // 0-100 percentage and treats the rest as an optional OSD label. VERIFIED live on
+    // the greg10.2 VTX (reading /tmp/aalink_ext.msg while injecting): "90,gs" ->
+    // rssi_udp≈95 -> used_rssi=min(rssi_local,rssi_udp) -> mcs5 / 20.3 Mbps; the value
+    // tracks (a lower "40,gs" down-adapts MCS).
     //
     // Two forms we USED to send both FAILED and one actively POISONED the link:
     //   * "gs_string=gs rssi_a = NN(%), rssi_b = NN(%)" is aalink's LOCAL driver-hook
-    //     format ("%*[^=]=%*s rssi_a = %d(%%)..."), NOT the UDP format. Sending it
-    //     over UDP made aalink flip used_source to "lowest" but parse rssi_udp=0 ->
-    //     min()=0 -> MCS0 -> ~100 kbps. This was the phone's 100 kbps bug.
-    //   * the bare "%d" WITHOUT the '%' was ignored entirely (rssi_udp stayed -1).
-    // So send ONLY the "%d%%" form. pctB is kept for the diagnostic log below.
+    //     format ("%*[^=]=%*s rssi_a = %d(%%)..."), NOT the UDP format. Over UDP its
+    //     embedded comma is the first one aalink splits on, so it atoi()s the leading
+    //     "gs_string=gs rssi_a = NN(%)" text -> 0 (no leading digit) -> used_source
+    //     flips to "lowest", rssi_udp=0 -> min()=0 -> MCS0 -> ~100 kbps. The phone bug.
+    //   * the bare "%d" WITHOUT any trailing token was ignored entirely (rssi_udp=-1).
+    // Send ONLY the "%d,gs" form (identical to Windows). pctB is kept for the log below.
     int pctA = LqFeedback::rssiPct((int)sA), pctB = LqFeedback::rssiPct((int)sB);
-    n = std::snprintf(buf, sizeof(buf), "%d%%", pctA);
+    n = std::snprintf(buf, sizeof(buf), "%d,gs", pctA);
     if (n > 0) {
         if (g.sink) g.sink(buf, n);
         else if (g.sock >= 0) ::sendto(g.sock, buf, (size_t)n, 0, (sockaddr*)&g.dst, sizeof(g.dst));
